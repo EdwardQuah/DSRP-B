@@ -1,0 +1,227 @@
+# We use BLIP-base to generate basic captions on a frame from the video files here
+
+# Setup and loading
+import sys
+import importlib
+from pathlib import Path
+import subprocess
+import shlex
+import math
+import numpy as np
+import pandas as pd
+from PIL import Image
+import torch
+from packaging import version
+import transformers
+from transformers import BlipProcessor, BlipForConditionalGeneration
+from transformers import AutoProcessor
+from tqdm import tqdm
+
+print("Python:", sys.version)
+
+# Adjust root if needed
+root = Path.cwd().parent
+print("Root:", root)
+
+# Segments manifest (deduped unique segments from S5)
+SEG_MANIFEST = root / "processed" / "segments_manifest_dedup_unique.csv"
+
+df = pd.read_csv(SEG_MANIFEST)
+print("Loaded segments manifest:", SEG_MANIFEST)
+print("Columns:", df.columns.tolist())
+print("Rows:", len(df))
+
+# Basic filtering – we only want segments that are ok & kept
+if "seg_ok" in df.columns:
+    df = df[df["seg_ok"] == True]
+if "seg_keep" in df.columns:
+    df = df[df["seg_keep"] == True]
+
+df = df.copy().reset_index(drop=True)
+print("After seg_ok & seg_keep filter:", len(df))
+
+# Check mandatory columns
+required_cols = ["segment_id", "parent_video_id", "path_video_seg", "start_s", "end_s"]
+for c in required_cols:
+    if c not in df.columns:
+        raise KeyError(f"Expected column '{c}' not found in {SEG_MANIFEST}")
+
+# Add caption-related columns if missing
+for col in ["caption_blip", "caption_error", "frame_path"]:
+    if col not in df.columns:
+        df[col] = pd.NA
+
+# Where we'll save extracted frames
+FRAME_DIR = root / "processed" / "s8_frames"
+FRAME_DIR.mkdir(parents=True, exist_ok=True)
+print("Frame directory:", FRAME_DIR)
+
+# Where we'll save the updated manifest
+OUT_MANIFEST = root / "processed" / "s8_segments_with_captions.csv"
+print("Output captioned manifest will be:", OUT_MANIFEST)
+
+BLIP_MODEL_NAME = "Salesforce/blip-image-captioning-base"
+
+print("Loading BLIP model:", BLIP_MODEL_NAME)
+
+# AutoProcessor handles both image pre-processing and tokenizer
+blip_processor = AutoProcessor.from_pretrained(BLIP_MODEL_NAME)
+
+# Use float32 (safe for MPS and CPU)
+blip_model = BlipForConditionalGeneration.from_pretrained(
+    BLIP_MODEL_NAME,
+    torch_dtype=torch.float32
+)
+
+blip_model.to(device)
+blip_model.eval()
+
+print("BLIP model loaded and moved to device.")
+
+
+
+def run_cmd(cmd: str, timeout_s: int = 600):
+    """
+    Simple wrapper to execute a shell command and capture stdout/stderr.
+    Returns: (return_code, stdout, stderr)
+    """
+    proc = subprocess.Popen(
+        cmd,
+        shell=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        out, err = proc.communicate(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        out, err = proc.communicate()
+        raise RuntimeError(f"Command timed out: {cmd[:200]}")
+    return proc.returncode, out, err
+
+
+def extract_mid_frame_for_segment(row, frame_dir: Path) -> Path:
+    """
+    Use ffmpeg to grab a single middle frame from the segment video.
+    - row: a pandas.Series with path_video_seg, start_s, end_s, segment_id
+    - frame_dir: directory to save frames
+    Returns: Path to the extracted JPEG.
+    """
+    seg_id = row["segment_id"]
+    v_path = Path(row["path_video_seg"])
+
+    if not v_path.exists():
+        raise FileNotFoundError(f"Video segment not found: {v_path}")
+
+    start_s = float(row["start_s"])
+    end_s   = float(row["end_s"])
+    seg_len = max(end_s - start_s, 0.0)
+
+    # Time (absolute in the parent video) for the mid-frame
+    t_abs = start_s + seg_len / 2.0 if seg_len > 0 else start_s
+
+    out_jpg = frame_dir / f"{seg_id}_frame.jpg"
+
+    # If frame already exists, just reuse (idempotent)
+    if out_jpg.exists():
+        return out_jpg
+
+    cmd = (
+        "ffmpeg -y -loglevel error -hide_banner "
+        f"-ss {t_abs:.3f} "
+        f"-i {shlex.quote(str(v_path))} "
+        "-frames:v 1 "
+        "-q:v 2 "
+        f"{shlex.quote(str(out_jpg))}"
+    )
+
+    rc, out, err = run_cmd(cmd, timeout_s=120)
+    if rc != 0:
+        raise RuntimeError(f"ffmpeg_frame_fail: {err[:200]}")
+
+    if not out_jpg.exists():
+        raise RuntimeError("frame_not_created")
+
+    return out_jpg
+
+
+@torch.no_grad()
+def generate_caption_from_frame(frame_path: Path, max_new_tokens: int = 30) -> str:
+    """
+    Run BLIP on a single pre-extracted frame and return a caption string.
+    """
+    image = Image.open(frame_path).convert("RGB")
+    inputs = processor(images=image, return_tensors="pt").to(device)
+
+    with torch.no_grad():
+        out_ids = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            num_beams=3,
+            do_sample=False
+        )
+
+    caption = processor.decode(out_ids[0], skip_special_tokens=True).strip()
+    return caption
+
+# Only caption rows where caption_blip is missing or empty
+mask_pending = df["caption_blip"].isna() | (df["caption_blip"].astype(str).str.strip() == "")
+df_pending = df[mask_pending].copy()
+
+print(f"Total rows        : {len(df)}")
+print(f"Rows needing caps : {len(df_pending)}")
+
+created = 0
+frame_missing = 0
+model_failed = 0
+
+for idx, row in tqdm(df_pending.iterrows(), total=len(df_pending), desc="Captioning from frames"):
+    seg_id = row["segment_id"]
+
+    # Frame file from S6 (CLIP)
+    frame_jpg = FRAME_DIR / f"{seg_id}_frame.jpg"
+
+    if not frame_jpg.exists():
+        # Log as frame_missing, do not try BLIP
+        df.loc[idx, "caption_blip"] = pd.NA
+        df.loc[idx, "caption_error"] = "frame_missing"
+        frame_missing += 1
+        continue
+
+    try:
+        caption = generate_caption_from_frame(frame_jpg)
+        df.loc[idx, "caption_blip"] = caption
+        df.loc[idx, "caption_error"] = ""
+        created += 1
+
+    except Exception as e:
+        df.loc[idx, "caption_blip"] = pd.NA
+        df.loc[idx, "caption_error"] = f"blip_error:{type(e).__name__}:{str(e)[:150]}"
+        model_failed += 1
+
+print("\n=== Caption-from-frames summary ===")
+print("  Newly created captions:", created)
+print("  Frame missing         :", frame_missing)
+print("  BLIP/model failures   :", model_failed)
+
+print("\nFinal caption stats:")
+print("  Non-null captions:", df["caption_blip"].notna().sum())
+print("  Non-empty errors :", (df["caption_error"].astype(str) != "").sum())
+
+OUT_CSV = root / "processed" / "s8_segments_with_captions_v2.csv"
+df.to_csv(OUT_CSV, index=False)
+print("Wrote updated captions CSV →", OUT_CSV)
+
+# Basic caption length stats
+caption_lengths = df["caption_blip"].dropna().str.split().str.len()
+print("\nCaption length stats (words):")
+print(caption_lengths.describe())
+
+# Select unique captions
+unique_caps = df["caption_blip"].dropna().unique()
+
+# Preview first 20 captions
+for c in unique_caps[:20]:
+    print(c)
+
