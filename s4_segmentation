@@ -1,0 +1,244 @@
+# S4: Temporal segmentation of standardised video + normalised audio
+
+# Setup and import
+import pandas as pd
+from pathlib import Path
+from tqdm.auto import tqdm
+import subprocess, shlex, math, csv
+
+# ---- Config ----
+ROOT = <YOUR PROJECT ROOT>
+BATCH = ROOT / "downloads" / "batch_0001"
+
+MANIFEST = BATCH / <YOUR S3 MANIFEST OUTPUT>  # post S3 manifest
+
+SEG_ROOT = ROOT / "processed" / "segments"
+VID_SEG_DIR = SEG_ROOT / "video"
+AUD_SEG_DIR = SEG_ROOT / "audio"
+SEG_MANIFEST = SEG_ROOT / "segments_manifest.csv"
+
+VID_SEG_DIR.mkdir(parents=True, exist_ok=True)
+AUD_SEG_DIR.mkdir(parents=True, exist_ok=True)
+SEG_ROOT.mkdir(parents=True, exist_ok=True)
+
+# segmentation parameters (adjust as needed)
+SEG_LEN = 10.0       # seconds
+SEG_HOP = 5.0        # seconds (50% overlap)
+MIN_PARENT_DUR = 20  # must be at least this long
+MAX_SEG_PER_VIDEO = None  # or an int if you want a cap
+
+def run_cmd(cmd: str, timeout_s: int = 600):
+    """Run a shell command; return (rc, stdout, stderr)."""
+    proc = subprocess.run(
+        cmd,
+        shell=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=timeout_s,
+    )
+    return proc.returncode, proc.stdout, proc.stderr
+
+def make_segments(duration_s: float, seg_len: float, hop: float):
+    """
+    Generate (start, end) pairs that fully cover [0, duration_s)
+    with given length + hop. Last segment is clipped to duration_s.
+    """
+    segments = []
+    if duration_s < MIN_PARENT_DUR:
+        return segments
+
+    t = 0.0
+    while t + 1e-3 < duration_s:  # small epsilon
+        start = t
+        end = min(t + seg_len, duration_s)
+        if end - start >= seg_len * 0.5:  # avoid ultra-short tail segments
+            segments.append((start, end))
+        t += hop
+    return segments
+
+def segment_exists_csv(seg_manifest: Path):
+    """Return a set of existing segment_ids, if manifest already exists."""
+    if not seg_manifest.exists():
+        return set()
+    seg_ids = set()
+    with seg_manifest.open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for r in reader:
+            sid = r.get("segment_id")
+            if sid:
+                seg_ids.add(sid)
+    return seg_ids
+
+df = pd.read_csv(MANIFEST)
+required_cols = ["video_id", "vid_std_path", "aud_path", "vid_std_ok", "aud_ok"]
+missing = [c for c in required_cols if c not in df.columns]
+if missing:
+    raise ValueError(f"Manifest is missing columns: {missing}")
+
+candidates = df[
+    (df["vid_std_ok"].fillna(False)) &
+    (df["aud_ok"].fillna(False))
+].copy()
+
+print(f"S4: {len(candidates)} parent videos with both std video + norm audio")
+
+# ensure duration column exists (from S1; otherwise set NaN and skip)
+if "duration" not in candidates.columns:
+    candidates["duration"] = math.nan
+existing_seg_ids = segment_exists_csv(SEG_MANIFEST)
+write_header = not SEG_MANIFEST.exists()
+
+fieldnames = [
+    "segment_id",
+    "parent_video_id",
+    "seg_idx",
+    "start_s",
+    "end_s",
+    "path_video_seg",
+    "path_audio_seg",
+    "seg_ok",
+    "seg_error",
+]
+
+seg_fp = SEG_MANIFEST.open("a", newline="", encoding="utf-8")
+writer = csv.DictWriter(seg_fp, fieldnames=fieldnames)
+if write_header:
+    writer.writeheader()
+
+#  Main segmentation loop 
+
+created = 0
+skipped = 0
+
+for _, row in tqdm(candidates.iterrows(), total=len(candidates)):
+    vid = row["video_id"]
+    v_src = Path(row["vid_std_path"])
+    a_src = Path(row["aud_path"])
+    dur = float(row.get("duration", math.nan))
+
+    if not v_src.exists() or not a_src.exists():
+        writer.writerow({
+            "segment_id": "",
+            "parent_video_id": vid,
+            "seg_idx": -1,
+            "start_s": 0.0,
+            "end_s": 0.0,
+            "path_video_seg": "",
+            "path_audio_seg": "",
+            "seg_ok": False,
+            "seg_error": "parent_missing",
+        })
+        continue
+
+    if not math.isfinite(dur) or dur < MIN_PARENT_DUR:
+        # you can choose to probe with ffprobe here if needed
+        continue
+
+    segs = make_segments(dur, SEG_LEN, SEG_HOP)
+    if MAX_SEG_PER_VIDEO is not None:
+        segs = segs[:MAX_SEG_PER_VIDEO]
+
+    for idx, (start, end) in enumerate(segs):
+        seg_id = f"{vid}_seg{idx:03d}"
+        if seg_id in existing_seg_ids:
+            skipped += 1
+            continue
+
+        v_out = VID_SEG_DIR / f"{seg_id}.mp4"
+        a_out = AUD_SEG_DIR / f"{seg_id}.wav"
+
+        # ffmpeg: cut video (keep both video+audio)
+        v_cmd = (
+            "ffmpeg -y -loglevel error -hide_banner "
+            f"-ss {start:.3f} -to {end:.3f} "
+            f"-i {shlex.quote(str(v_src))} "
+            "-c copy "
+            f"{shlex.quote(str(v_out))}"
+        )
+
+        # ffmpeg: cut audio from normalised wav
+        a_cmd = (
+            "ffmpeg -y -loglevel error -hide_banner "
+            f"-ss {start:.3f} -to {end:.3f} "
+            f"-i {shlex.quote(str(a_src))} "
+            "-ac 2 -ar 48000 -sample_fmt s16 "
+            f"{shlex.quote(str(a_out))}"
+        )
+
+        try:
+            rc_v, _, err_v = run_cmd(v_cmd, timeout_s=600)
+            if rc_v != 0:
+                raise RuntimeError(f"video_seg_fail: {err_v[:200]}")
+
+            rc_a, _, err_a = run_cmd(a_cmd, timeout_s=600)
+            if rc_a != 0:
+                raise RuntimeError(f"audio_seg_fail: {err_a[:200]}")
+
+            writer.writerow({
+                "segment_id": seg_id,
+                "parent_video_id": vid,
+                "seg_idx": idx,
+                "start_s": start,
+                "end_s": end,
+                "path_video_seg": str(v_out.resolve()),
+                "path_audio_seg": str(a_out.resolve()),
+                "seg_ok": True,
+                "seg_error": "",
+            })
+            existing_seg_ids.add(seg_id)
+            created += 1
+
+        except Exception as e:
+            writer.writerow({
+                "segment_id": seg_id,
+                "parent_video_id": vid,
+                "seg_idx": idx,
+                "start_s": start,
+                "end_s": end,
+                "path_video_seg": str(v_out.resolve()),
+                "path_audio_seg": str(a_out.resolve()),
+                "seg_ok": False,
+                "seg_error": f"{type(e).__name__}:{str(e)[:200]}",
+            })
+            existing_seg_ids.add(seg_id)
+            created += 1
+
+seg_fp.close()
+print(f"S4 done | created/updated {created} rows, skipped existing {skipped}")
+print("Segments manifest:", SEG_MANIFEST)
+
+
+# Diagnostics
+MAIN_MANIFEST = BATCH / "s1_qc_manifest.csv"      # S1+S2+S3 manifest
+SEG_MANIFEST  = SEG_ROOT / "segments_manifest.csv" # or wherever S4 wrote it
+
+# Change variable to your acual path
+df_main = pd.read_csv(MAIN_MANIFEST) # main manifest
+df_seg  = pd.read_csv(SEG_MANIFEST) # segment manifest
+
+print("Main manifest rows:", len(df_main))
+print("Segments manifest rows:", len(df_seg))
+
+print("\nseg_ok value counts:")
+print(df_seg["seg_ok"].value_counts(dropna=False))
+print("\nAny seg_error examples:")
+print(df_seg.loc[df_seg["seg_error"].astype(str).str.len() > 0, ["segment_id", "seg_error"]].head(10))
+
+df_seg["seg_dur"] = df_seg["end_s"] - df_seg["start_s"]
+
+print(df_seg["seg_dur"].describe())
+
+# Quick sanity bucketing
+bins = [0, 5, 9, 11, 14, 16, 30, 60]
+print("\nSegment duration buckets:")
+print(pd.cut(df_seg["seg_dur"], bins=bins).value_counts().sort_index())
+
+import matplotlib.pyplot as plt
+
+plt.figure(figsize=(6,4))
+df_seg["seg_dur"].hist(bins=30)
+plt.xlabel("Segment duration (s)")
+plt.ylabel("Count")
+plt.title("Distribution of segment durations (S4)")
+plt.show()
