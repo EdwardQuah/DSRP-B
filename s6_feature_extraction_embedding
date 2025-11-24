@@ -1,0 +1,410 @@
+# ###
+# """For every deduplicated segment in
+# processed/segments_manifest_dedup_unique.csv it will:
+# 	1.	Audio embedding (librosa)
+# 	•	Load path_audio_seg (.wav from S4).
+# 	•	Compute a 64-dim mel-spectrogram mean feature.
+# 	•	Save to processed/features/audio/<segment_id>_mel64.npy.
+# 	•	Record audio_emb_path, audio_emb_dim, audio_emb_error.
+# 	2.	Video embedding (OpenCLIP)
+# 	•	Take the middle frame of path_video_seg via ffmpeg.
+# 	•	Run it through OpenCLIP ViT-B/32 (pretrained LAION).
+# 	•	Save embedding to processed/features/video/<segment_id>_clip.npy.
+# 	•	Record video_emb_path, video_emb_dim, video_emb_error.
+# 	3.	Update segments manifest (in place)
+# 	•	New columns appended to segments_manifest_dedup_unique.csv.
+# 	•	Idempotent: re-running only recomputes where files/paths are missing.
+# 	4.	Do some quick sanity checks
+# 	•	Print counts of successes/failures.
+# 	•	Simple stats on embedding norms (optional plots at the end). """
+# ###
+
+# Setup and Loading
+import os
+import math
+import json
+import shlex
+import subprocess
+from pathlib import Path
+import numpy as np
+import pandas as pd
+from tqdm.auto import tqdm
+import librosa
+import torch
+from PIL import Image
+import open_clip
+
+# Assume this notebook lives in root/nb/ or similar
+root = Path.cwd().parent   # same pattern as S4/S5
+print("root:", root)
+
+# Segments (deduplicated) manifest from S5
+SEG_MANIFEST = root / "processed" / "segments_manifest_dedup_unique.csv"
+
+# Where we store embeddings
+AUDIO_FEAT_DIR = root / "processed" / "features" / "audio"
+VIDEO_FEAT_DIR = root / "processed" / "features" / "video"
+FRAME_DIR      = root / "processed" / "features" / "frames"
+
+for d in [AUDIO_FEAT_DIR, VIDEO_FEAT_DIR, FRAME_DIR]:
+    d.mkdir(parents=True, exist_ok=True)
+
+print("Using segments manifest:", SEG_MANIFEST)
+print("Audio feats dir:", AUDIO_FEAT_DIR)
+print("Video feats dir:", VIDEO_FEAT_DIR)
+print("Frame dir:", FRAME_DIR)
+
+
+def run_cmd(cmd: str, timeout_s: int = 600):
+    """Run shell command; return (returncode, stdout, stderr)."""
+    proc = subprocess.run(
+        cmd,
+        shell=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=timeout_s,
+    )
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+df = pd.read_csv(SEG_MANIFEST)
+print("Segments rows:", len(df))
+print("Columns:", df.columns.tolist())
+
+# New columns we will populate
+NEW_COLS = [
+    "audio_emb_path", "audio_emb_dim", "audio_emb_error",
+    "video_emb_path", "video_emb_dim", "video_emb_error",
+]
+
+for c in NEW_COLS:
+    if c not in df.columns:
+        df[c] = pd.NA
+
+df.head()
+
+def extract_audio_embedding(
+    wav_path: Path,
+    sr: int = 22050,
+    n_mels: int = 64,
+) -> np.ndarray:
+    """
+    Compute a simple audio embedding:
+    - Load mono audio at given sample rate
+    - Compute mel-spectrogram (power)
+    - Convert to dB
+    - Take mean over time (-> 64-dim vector)
+    """
+    y, sr = librosa.load(wav_path, sr=sr, mono=True)
+    if y.size == 0:
+        raise RuntimeError("empty_audio")
+
+    mel = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=n_mels)
+    mel_db = librosa.power_to_db(mel, ref=np.max)
+    feat = mel_db.mean(axis=1).astype(np.float32)  # shape (n_mels,)
+    return feat
+
+audio_created = 0
+audio_skipped = 0
+audio_failed  = 0
+
+for idx, row in tqdm(df.iterrows(), total=len(df), desc="Audio embeddings"):
+    seg_id = row["segment_id"]
+    wav_path = Path(row["path_audio_seg"])
+
+    if not wav_path.exists():
+        df.loc[idx, "audio_emb_error"] = "audio_missing"
+        audio_failed += 1
+        continue
+
+    out_npy = AUDIO_FEAT_DIR / f"{seg_id}_mel64.npy"
+
+    # If file already exists AND manifest has it, just skip (idempotent)
+    if out_npy.exists() and pd.notna(row.get("audio_emb_path", None)):
+        audio_skipped += 1
+        continue
+
+    try:
+        feat = extract_audio_embedding(wav_path)
+        np.save(out_npy, feat)
+
+        df.loc[idx, "audio_emb_path"]  = str(out_npy.resolve())
+        df.loc[idx, "audio_emb_dim"]   = feat.shape[0]
+        df.loc[idx, "audio_emb_error"] = ""
+
+        audio_created += 1
+
+    except Exception as e:
+        df.loc[idx, "audio_emb_path"]  = pd.NA
+        df.loc[idx, "audio_emb_dim"]   = pd.NA
+        df.loc[idx, "audio_emb_error"] = f"{type(e).__name__}:{str(e)[:200]}"
+        audio_failed += 1
+
+print("\n=== Audio embedding summary ===")
+print("Created:", audio_created)
+print("Skipped existing:", audio_skipped)
+print("Failed:", audio_failed)
+
+device = "cuda" if torch.cuda.is_available() else (
+    "mps" if torch.backends.mps.is_available() else "cpu"
+)
+print("Using device:", device)
+
+CLIP_MODEL_NAME = "ViT-B-32"
+CLIP_PRETRAINED = "laion2b_s34b_b79k"
+
+model, _, preprocess = open_clip.create_model_and_transforms(
+    CLIP_MODEL_NAME,
+    pretrained=CLIP_PRETRAINED,
+)
+model.to(device)
+model.eval()
+
+print("CLIP model loaded:", CLIP_MODEL_NAME, CLIP_PRETRAINED)
+
+def extract_mid_frame(video_path: Path, frame_path: Path, seg_len_s: float = None):
+    """
+    Use ffmpeg to grab a single middle frame from the segment.
+    If seg_len_s is given, sample at seg_len_s/2; otherwise just take frame 0.
+    """
+    if seg_len_s is not None and math.isfinite(seg_len_s) and seg_len_s > 0:
+        t = seg_len_s / 2.0
+    else:
+        t = 0.0
+
+    cmd = (
+        "ffmpeg -y -loglevel error -hide_banner "
+        f"-ss {t:.3f} "
+        f"-i {shlex.quote(str(video_path))} "
+        "-frames:v 1 "
+        "-q:v 2 "
+        f"{shlex.quote(str(frame_path))}"
+    )
+    rc, out, err = run_cmd(cmd, timeout_s=120)
+    if rc != 0:
+        raise RuntimeError(f"ffmpeg_frame_fail:{err[:200]}")
+
+    if not frame_path.exists():
+        raise RuntimeError("frame_not_created")
+    return frame_path
+
+
+def extract_clip_embedding(frame_path: Path) -> np.ndarray:
+    """
+    Run a single image through CLIP and return a normalised embedding.
+    """
+    image = Image.open(frame_path).convert("RGB")
+    image_input = preprocess(image).unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        feat = model.encode_image(image_input)
+        feat = feat / feat.norm(dim=-1, keepdim=True)
+
+    feat = feat.cpu().numpy().astype(np.float32)[0]  # shape (D,)
+    return feat
+
+video_created = 0
+video_skipped = 0
+video_failed  = 0
+
+for idx, row in tqdm(df.iterrows(), total=len(df), desc="Video embeddings"):
+    seg_id   = row["segment_id"]
+    vid_path = Path(row["path_video_seg"])
+
+    if not vid_path.exists():
+        df.loc[idx, "video_emb_error"] = "video_missing"
+        video_failed += 1
+        continue
+
+    out_npy   = VIDEO_FEAT_DIR / f"{seg_id}_clip.npy"
+    frame_jpg = FRAME_DIR / f"{seg_id}_frame.jpg"
+
+    # If embedding already exists AND manifest has it, skip
+    if out_npy.exists() and pd.notna(row.get("video_emb_path", None)):
+        video_skipped += 1
+        continue
+
+    # Estimate segment duration from manifest (end_s - start_s)
+    try:
+        seg_len = float(row["end_s"] - row["start_s"])
+    except Exception:
+        seg_len = None
+
+    try:
+        # 1) extract middle frame
+        extract_mid_frame(vid_path, frame_jpg, seg_len_s=seg_len)
+
+        # 2) CLIP embedding
+        feat = extract_clip_embedding(frame_jpg)
+
+        np.save(out_npy, feat)
+
+        df.loc[idx, "video_emb_path"]  = str(out_npy.resolve())
+        df.loc[idx, "video_emb_dim"]   = feat.shape[0]
+        df.loc[idx, "video_emb_error"] = ""
+
+        video_created += 1
+
+    except Exception as e:
+        df.loc[idx, "video_emb_path"]  = pd.NA
+        df.loc[idx, "video_emb_dim"]   = pd.NA
+        df.loc[idx, "video_emb_error"] = f"{type(e).__name__}:{str(e)[:200]}"
+        video_failed += 1
+
+print("\n=== Video embedding summary ===")
+print("Created:", video_created)
+print("Skipped existing:", video_skipped)
+print("Failed:", video_failed)
+
+df.to_csv(SEG_MANIFEST, index=False)
+print("Updated segments manifest written →", SEG_MANIFEST)
+
+# Basic checks
+print("\nNon-null audio embeddings:", df["audio_emb_path"].notna().sum())
+print("Non-null video embeddings:", df["video_emb_path"].notna().sum())
+
+print("\nAudio embedding errors (top 5):")
+print(df["audio_emb_error"].value_counts(dropna=False).head())
+
+print("\nVideo embedding errors (top 5):")
+print(df["video_emb_error"].value_counts(dropna=False).head())
+
+import matplotlib.pyplot as plt
+
+# Load a small sample of audio embeddings to inspect norms
+audio_norms = []
+video_norms = []
+
+for _, row in df.sample(min(500, len(df)), random_state=42).iterrows():
+    if pd.notna(row["audio_emb_path"]):
+        v = np.load(row["audio_emb_path"])
+        audio_norms.append(np.linalg.norm(v))
+
+    if pd.notna(row["video_emb_path"]):
+        v = np.load(row["video_emb_path"])
+        video_norms.append(np.linalg.norm(v))
+
+plt.figure(figsize=(10,4))
+plt.hist(audio_norms, bins=30)
+plt.title("Norms of audio embeddings (mel64)")
+plt.xlabel("L2 norm")
+plt.ylabel("Count")
+plt.show()
+
+df = pd.read_csv(SEG_MANIFEST) 
+
+print("Non-null video_emb_path:", df["video_emb_path"].notna().sum())
+print("Unique video_emb_dim:", df["video_emb_dim"].dropna().unique()[:10])
+print(df[["segment_id", "video_emb_path", "video_emb_dim", "video_emb_error"]].head())
+
+row = df[df["video_emb_path"].notna()].iloc[0]
+path = Path(row["video_emb_path"])
+vec = np.load(path)
+
+print("Shape:", vec.shape)
+print("First 5 values:", vec[:5])
+print("L2 norm:", np.linalg.norm(vec))
+
+# Assuming norms = L2 norms array
+norms = np.array(norms)
+dev = norms - 1.0  # deviation from 1.0
+
+plt.figure(figsize=(10,5))
+plt.hist(dev * 1e6, bins=40)  # convert to micro-units for readability
+plt.axvline(0, color="red", linestyle="--", label="Expected (0 deviation)")
+
+plt.title("Deviation of CLIP Embedding Norms from 1.0 (in micro deviation)")
+plt.xlabel("Deviation × 1e-6")
+plt.ylabel("Count")
+plt.legend()
+plt.grid(alpha=0.3)
+plt.show()
+
+df_vis = pd.read_csv(SEG_MANIFEST)
+n_segments = len(df_vis)
+
+audio_non_null = df_vis["audio_emb_path"].notna().sum()
+video_non_null = df_vis["video_emb_path"].notna().sum()
+
+audio_dim_values = df_vis["audio_emb_dim"].dropna().unique()
+video_dim_values = df_vis["video_emb_dim"].dropna().unique()
+
+audio_dims_str = ", ".join(str(d) for d in sorted(audio_dim_values))
+video_dims_str = ", ".join(str(d) for d in sorted(video_dim_values))
+
+audio_fail = df_vis["audio_emb_error"].notna().sum()
+video_fail = df_vis["video_emb_error"].notna().sum()
+
+summary_df = pd.DataFrame({
+    "Embedding type": ["Audio (mel)", "Video (CLIP)"],
+    "Segments with embedding": [audio_non_null, video_non_null],
+    "Total segments": [n_segments, n_segments],
+    "Coverage (%)": [
+        100.0 * audio_non_null / n_segments,
+        100.0 * video_non_null / n_segments,
+    ],
+    "Dimensionality": [audio_dims_str, video_dims_str],
+    "Failures": [audio_fail, video_fail],
+})
+
+print("S6 Embedding Summary")
+print(summary_df)
+
+plt.figure(figsize=(5, 4))
+types = ["Audio (mel)", "Video (CLIP)"]
+coverage_counts = [audio_non_null, video_non_null]
+
+plt.bar(types, coverage_counts)
+plt.ylabel("Number of segments")
+plt.title("S6 embedding coverage (n = %d segments)" % n_segments)
+plt.tight_layout()
+plt.show()
+
+
+for path in df_vis["video_emb_path"].dropna():
+    try:
+        emb = np.load(path)
+        norm = np.linalg.norm(emb)
+        clip_norms.append(norm)
+    except Exception:
+        continue
+
+clip_norms = np.array(clip_norms)
+
+print("\n=== CLIP embedding norms summary ===")
+print("Count:", clip_norms.size)
+print("Mean:", clip_norms.mean() if clip_norms.size > 0 else None)
+print("Std:", clip_norms.std() if clip_norms.size > 0 else None)
+print("Min:", clip_norms.min() if clip_norms.size > 0 else None)
+print("Max:", clip_norms.max() if clip_norms.size > 0 else None)
+
+
+# Filter to segments with mel64 embeddings
+mel_paths = df["audio_emb_path"].dropna().tolist()
+
+mel_norms = []
+
+for path in mel_paths:
+    try:
+        emb = np.load(path)
+        mel_norms.append(np.linalg.norm(emb))
+    except Exception as e:
+        print(f"Failed to load {path}: {e}")
+
+mel_norms = np.array(mel_norms)
+
+# Build summary table
+summary = pd.DataFrame({
+    "Statistic": ["Count", "Mean", "Std", "Min", "Max"],
+    "mel64_norm": [
+        mel_norms.size,
+        mel_norms.mean(),
+        mel_norms.std(),
+        mel_norms.min(),
+        mel_norms.max(),
+    ]
+})
+
+print(summary)
+
