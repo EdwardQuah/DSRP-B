@@ -1,0 +1,756 @@
+### PipelineV6 (STRICT QUOTA, DURATION-GATED, CLEAN FOLDERS, PAGED SEARCH)
+### CC search via YouTube Data API (requests, no googleapiclient)
+### Download via yt-dlp (progressive MP4 preferred; retries, pacing, backoff)
+### Strict per-genre quotas: keeps paging & trying until each genre is filled
+### Enforces 60–180s duration via yt-dlp match_filter
+### Numbered batch folders; videos and sidecars separated
+### Suppresses SABR warning noise in logs
+
+### Setup and load libraries
+import os
+import time
+import random
+import logging
+from pathlib import Path
+import requests
+from yt_dlp import YoutubeDL
+from yt_dlp.utils import match_filter_func
+
+
+### Configuration 
+API_KEY = <INSERT YOUR API KEY> 
+FMT_MP4_PREF = "18/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" # Your preferred format
+FMT_ANY      = "bv*+ba/b" 
+YTDLP_PLAYER_CLIENT_VERSION = "2.20241101.08.00" #YTDLP Client version.
+
+
+### Genres (will have equal ratio for each genre)
+SEARCH_TERMS = [
+ "blues",
+"classical",
+"country",
+"disco",
+"hiphop",
+"jazz",
+"metal",
+"pop",
+"reggae",
+"rock"
+]
+
+
+COOKIES_FILE = Path.cwd()/"youtube_cookies.txt"
+### Targets
+MAX_VIDEOS = 200                 
+VIDEO_DURATION_HINT = "short"    # any | short | medium | long | any
+PAGE_SIZE = 50                   # YouTube Data API max per page
+MAX_PAGES_PER_GENRE = 20         # safety cap: 50 * 20 = 1000 candidates/genre
+
+### Duration gate (toggle ON for 60–180s strictness)
+ENFORCE_DURATION = True         # set True to enforce the bounds below
+DURATION_MIN_S = 60
+DURATION_MAX_S = 300
+
+### Layout
+DOWNLOAD_ROOT = Path("downloads")
+LOG_DIR = Path("logs")
+ARCHIVE_FILE = DOWNLOAD_ROOT / "archive.txt"   # prevents download if url already in archive
+
+### Pacing/backoff to prevent throttle / blocks from YouTube
+JITTER_BETWEEN_ATTEMPTS = (1.0, 3.0)  # stops randomly between attempts
+JITTER_BETWEEN_PAGES = (2.0, 5.0)     # stops randomly between page searches
+BACKOFF_AFTER_FAILS = 3               # max cap for fails before sleep
+BACKOFF_SECONDS = 30                  # sleep for 30s before restarting
+
+
+import re
+def _next_batch_index(root: Path) -> int:
+    root.mkdir(parents=True, exist_ok=True)
+    idx = 0
+    pat = re.compile(r"^batch_(\d+)$")
+    for p in root.iterdir():
+        if p.is_dir():
+            m = pat.match(p.name)
+            if m:
+                try:
+                    idx = max(idx, int(m.group(1)))
+                except ValueError:
+                    pass
+    return idx + 1
+
+### Some configurations for batch file management
+### Batches in this version are saved successively and videos/metadata are separated to prevent clutter in one folder
+BATCH_ID = _next_batch_index(DOWNLOAD_ROOT)
+BATCH_DIR = DOWNLOAD_ROOT / f"batch_{BATCH_ID:04d}"
+VIDEOS_DIR = BATCH_DIR / "videos"
+META_DIR = BATCH_DIR / "meta"
+LOG_FILE = LOG_DIR / f"download_log_{BATCH_ID:04d}.txt"
+FAIL_LOG = LOG_DIR / f"failures_{BATCH_ID:04d}.txt"
+
+
+### Helper function to initiate directory
+def initialize_directories():
+    VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
+    META_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)   # ensure logs folder exists
+    ARCHIVE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if not ARCHIVE_FILE.exists():
+        ARCHIVE_FILE.touch()
+    # optional: write batch info (provenance)
+    info = {
+        "batch_id": BATCH_ID,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "genres": SEARCH_TERMS,
+        "targets": {"total": MAX_VIDEOS, "per_genre": MAX_VIDEOS // len(SEARCH_TERMS)},
+        "duration_gate": {"enabled": ENFORCE_DURATION, "min_s": DURATION_MIN_S, "max_s": DURATION_MAX_S},
+        "video_duration_hint": VIDEO_DURATION_HINT,
+    }
+    with open(BATCH_DIR / "batch_info.json", "w", encoding="utf-8") as f:
+        json.dump(info, f, ensure_ascii=False, indent=2)
+
+### Logging information for sanity check during runs
+for h in logging.root.handlers[:]:
+    logging.root.removeHandler(h)
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler()],
+)
+
+### If downloads fail, log reason
+def _append_fail(url: str, reason: str, genre: str):
+    try:
+        with FAIL_LOG.open("a", encoding="utf-8") as fh:
+            fh.write(f"{genre}\t{url}\t{reason}\n")
+    except Exception:
+        pass
+
+### SABR warnings keep popping up. This is just to mute/ignore the messages and prevent clutter
+class YTDLPLogger:
+    """Route yt-dlp logs into Python logging and hide SABR noise lines."""
+    def _ok(self, msg):
+        return bool(msg) and msg.strip()
+    def debug(self, msg):
+        if self._ok(msg) and "SABR streaming" not in msg:
+            logging.debug(msg)
+    def info(self, msg):
+        if self._ok(msg) and "SABR streaming" not in msg:
+            logging.info(msg)
+    def warning(self, msg):
+        if self._ok(msg) and "SABR streaming" not in msg:
+            logging.warning(msg)
+    def error(self, msg):
+        if self._ok(msg):
+            logging.error(msg)
+
+### ydl options for ydl library. A lot of settings must be set here for our usage case.
+### Preferred formats are MP4 but will will fallback to the next best thing and remux post-process if needed
+### Also some options for us to "sleep" or download videos in fragments
+### webclient is enforced  to help smoothen downloads
+### optional use of cookie files 
+
+def make_ydl_opts(videos_dir: Path, meta_dir: Path) -> Dict:
+    """
+    Robust yt-dlp options for CC YouTube downloads (dataset building).
+    - Android client first (stable for itag 22/18), Web fallback
+    - Prefer progressive MP4 (22, 18), then best mp4, then generic best
+    - Sidecars in meta_dir, video assets in videos_dir
+    - Optional cookies via env var COOKIES_FILE (Netscape format)
+    Requires globals:
+        ENFORCE_DURATION, DURATION_MIN_S, DURATION_MAX_S, ARCHIVE_FILE,
+        match_filter_func, YTDLPLogger
+    """
+    cookies_path = os.getenv("COOKIES_FILE")  # e.g., export COOKIES_FILE="$PWD/cookies.txt"
+
+    # Build match_filter callable
+    if ENFORCE_DURATION:
+        expr = f"!is_live & !is_upcoming & duration >= {DURATION_MIN_S} & duration <= {DURATION_MAX_S}"
+    else:
+        expr = "!is_live & !is_upcoming"
+    mf_callable = match_filter_func(expr)
+
+    # Prefer progressive MP4 for downstream simplicity:
+    #   22 = mp4 720p (progressive), 18 = mp4 360p (progressive)
+    preferred_format = "22/18/b[ext=mp4]/bv*+ba/b"
+
+    opts: Dict = {
+        # Logging: filtered logger to hide SABR lines etc.
+        "logger": YTDLPLogger(),
+
+        # Output structure & sidecars
+        "paths": {"home": str(videos_dir), "temp": str(videos_dir)},
+        "outtmpl": {
+            "default": "%(title).100s [%(id)s].%(ext)s",
+            "infojson": str(meta_dir / "%(id)s.%(ext)s"),
+            "description": str(meta_dir / "%(id)s.%(ext)s"),
+            "thumbnail": str(meta_dir / "%(id)s.%(ext)s"),
+            "subtitle": str(meta_dir / "%(id)s.%(ext)s"),
+        },
+        "nooverwrites": True,
+        "noplaylist": True,
+        "writeinfojson": True,
+        "writedescription": True,
+        "writethumbnail": True,
+        "writesubtitles": False,
+        "download_archive": str(ARCHIVE_FILE),
+
+        # Formats & post-processing
+        "format": preferred_format,
+        "merge_output_format": "mp4",
+        # NOTE: yt-dlp expects the legacy spelling 'preferedformat' (one 'r')
+        "postprocessors": [{"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"}],
+
+        # Filters
+        "match_filter": mf_callable,
+
+        # Stability & pacing
+        "retries": 5,
+        "fragment_retries": 5,
+        "extractor_retries": 3,
+        "concurrent_fragment_downloads": 1,
+        "sleep_interval": 2.0,
+        "max_sleep_interval": 5.0,
+        "sleep_interval_requests": 1.0,
+        "max_sleep_interval_requests": 2.5,
+        "ignoreerrors": True,
+
+        # Client profile: Android first (works w/o PO tokens for 22/18), Web fallback
+        "http_headers": {
+            "User-Agent": "com.google.android.youtube/19.15.35 (Linux; U; Android 13) gzip",
+            "Accept-Language": "en-US,en;q=0.5",
+        },
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "web"],
+                "player_client_version": ["19.15.35", "2.20241101.08.00"],
+                # Do NOT set 'po_token' unless providing a real token like "android.gvs+XXXXX"
+            }
+        },
+
+        # Keep warnings visible while stabilizing; flip to True later if desired
+        "quiet": False,
+        "no_warnings": False,
+
+        # Geo bypass (cookies/consent help too)
+        "geo_bypass": True,
+    }
+
+    # Optional cookies improve consent/age/region reliability
+    if cookies_path and os.path.exists(cookies_path):
+        opts["cookiefile"] = cookies_path
+        opts["geo_bypass_country"] = "AU"
+
+    return opts
+
+### This is a function to force the script to enforce quotas for genres if any of the urls from
+### search_youtube_cc_stream fails
+# --- helpers: extract YT video id and resolve downloaded file path ---
+from urllib.parse import urlparse, parse_qs
+def extract_video_id(url: str) -> str:
+    try:
+        qs = parse_qs(urlparse(url).query)
+        return (qs.get("v") or [""])[0]
+    except Exception:
+        return ""
+
+def _find_any_media_for(vid: str, folder: Path) -> str:
+    if not vid:
+        return ""
+    for p in folder.glob(f"*[{vid}].*"):
+        if p.is_file() and p.suffix.lower() in {".mp4", ".mkv", ".webm", ".m4a"}:
+            return str(p.resolve())
+    return ""
+
+# Purge any sidecars for a given video ID (called on failures)
+def purge_sidecars(meta_dir: Path, vid: str):
+    try:
+        for p in meta_dir.glob(f"{vid}.*"):
+            # covers: .info.json, .description, .webp/.jpg/.png, .srt/.vtt, etc.
+            p.unlink(missing_ok=True)
+    except Exception:
+        pass
+    
+def fill_genre_strict(term: str, target: int) -> int:
+    """
+    Strictly fill `target` items for a genre.
+    - Streams pages of candidates until target reached or pages exhausted
+    - De-dups across pages; shuffles within each page
+    - Logs title before downloading; backoff after repeated failures
+    - Counts a success ONLY if a media file exists post-download (avoids archive-skips)
+    """
+    _node_ready_msg()
+    total = 0
+    seen = set()
+    consec_fail = 0
+
+    # Primary web client instance for probe/title (fast)
+    probe_opts = make_ydl_opts_v6_fixed(VIDEOS_DIR, META_DIR, sidecars=True, fmt=FMT_MP4_PREF, merge="mp4")
+    with YoutubeDL(probe_opts) as ydl:
+        for page_urls in search_youtube_cc_stream(API_KEY, term, VIDEO_DURATION_HINT):
+            # de-dup and randomize page candidates
+            page_urls = [u for u in page_urls if u not in seen]
+            random.shuffle(page_urls)
+            seen.update(page_urls)
+
+            for url in page_urls:
+                if total >= target:
+                    return total
+
+                vid = url.rsplit("v=", 1)[-1]
+                title = None
+                try:
+                    info = ydl.extract_info(url, download=False)
+                    title = info.get("title")
+                except Exception:
+                    pass
+                if _looks_unwanted(title):
+                    logging.info(f"[{term}] Skipping unwanted: {title or url}")
+                    time.sleep(random.uniform(*JITTER_BETWEEN_ATTEMPTS))
+                    continue
+
+                # Quick probe: if no video formats (EJS/PO), skip
+                ok_probe, reason = _has_video_formats(ydl, url)
+                if not ok_probe:
+                    logging.warning(f"[{term}] Skipping (probe): {title or url} | {reason}")
+                    time.sleep(random.uniform(*JITTER_BETWEEN_ATTEMPTS))
+                    continue
+
+                disp = f"{title} ({url})" if title else url
+                logging.info(f"[{term}] Downloading: {disp}")
+
+                # Attempt with fallbacks across clients and formats
+                ok, why = download_with_fallbacks(url, VIDEOS_DIR, META_DIR, sidecars=True)
+                outfile = _find_media_file(VIDEOS_DIR, vid)
+                if ok and outfile:
+                    total += 1
+                    consec_fail = 0
+                    logging.info(f"[{term}] OK ({total}/{target}): {disp}")
+                    if info is None:
+                    try:
+                        info = ydl.extract_info(url, download=False)
+                    except Exception:
+                        info = {"id": vid}
+                _backfill_sidecars_if_missing(META_DIR, info)
+                else:
+                    consec_fail += 1
+                    logging.warning(f"[{term}] Download failed: {disp} | {why or 'UNKNOWN'}")
+                    if consec_fail >= BACKOFF_AFTER_FAILS:
+                        logging.info(f"[{term}] Pausing {BACKOFF_SECONDS}s after repeated failures…")
+                        time.sleep(BACKOFF_SECONDS)
+                        consec_fail = 0
+
+                time.sleep(random.uniform(*JITTER_BETWEEN_ATTEMPTS))
+
+            time.sleep(random.uniform(*JITTER_BETWEEN_PAGES))
+
+    return total
+
+# Positive synonyms per genre (extend as you like)
+GENRE_SYNS = {
+    "blues":     ["blues", "delta blues", "chicago blues"],
+    "classical": ["classical", "symphony", "sonata", "concerto", "orchestral"],
+    "country":   ["country", "bluegrass", "honky tonk"],
+    "disco":     ["disco", "nu-disco"],
+    "hiphop":    ["hip hop", "hip-hop", "rap", "boom bap", "trap"],
+    "jazz":      ["jazz", "bebop", "bossa nova", "swing", "cool jazz"],
+    "metal":     ["metal", "heavy metal", "thrash metal", "black metal", "death metal"],
+    "pop":       ["pop", "synthpop", "electropop"],
+    "reggae":    ["reggae", "dub reggae", "roots reggae", "dancehall"],
+    "rock":      ["rock", "alt rock", "hard rock", "indie rock"],
+}
+
+# Things to avoid at search time (lowercased substring match on title/desc/tags)
+NEGATIVE_TERMS = [
+    "cover", "remix", "tutorial", "lesson", "karaoke", "reaction",
+    "podcast", "interview", "vlog", "livestream", "live stream",
+    "live session", "gameplay", "mp3 download", "sound effect", "sfx",
+]
+
+def _looks_like_music(snippet: dict, syns: list[str], negs: list[str]) -> bool:
+    title = (snippet.get("title") or "").lower()
+    desc  = (snippet.get("description") or "").lower()
+    tags  = [t.lower() for t in (snippet.get("tags") or [])]
+
+    text_blobs = [title, desc, " ".join(tags)]
+    # Negative screen
+    if any(neg in blob for blob in text_blobs for neg in negs):
+        return False
+    # Positive genre signal (synonym must appear in title/desc/tags)
+    if not any(s in blob for blob in text_blobs for s in syns):
+        return False
+    return True
+
+def _has_video_formats(ydl: YoutubeDL, url: str) -> tuple[bool, str]:
+    """
+    Fast probe: (has_video, reason)
+    - Handles EJS/PO-token symptoms
+    - Safe against odd info dicts (no AttributeError)
+    """
+    try:
+        info = ydl.extract_info(url, download=False)
+        if not isinstance(info, dict):
+            return False, "PROBE_INFO_NOT_DICT"
+        fmts = info.get("formats") or []
+        if not isinstance(fmts, list):
+            return False, "PROBE_FORMATS_NOT_LIST"
+        has_video = any((f or {}).get("vcodec") not in (None, "", "none") for f in fmts)
+        if not has_video:
+            return False, "NO_VIDEO_FORMATS_EJS_OR_PO"
+        return True, ""
+    except Exception as e:
+        msg = (str(e) or "").lower()
+        if "n challenge" in msg or "signature solving failed" in msg or "only images" in msg:
+            return False, "EJS_CHALLENGE"
+        if "po token" in msg:
+            return False, "PO_TOKEN_REQUIRED"
+        return False, f"PROBE_ERROR:{type(e).__name__}"
+
+### This function generates a list of urls to try by searching one page at a time from YouTube API
+### Depends on MAX_PAGES_PER_GENRE variable.
+### Also shows log for which genre it has searched for and how many "candidates" passed the config requirements
+def search_youtube_cc_stream(api_key: str, query: str, video_duration: str = "any"):
+    """
+    Generator yielding lists of watch-URLs (one page at a time), but with:
+      - query strengthened to "<genre> music"
+      - search hints: order=relevance, relevanceLanguage=en, videoEmbeddable=true
+      - page-level vetting via videos.list:
+          * categoryId == "10" (Music) OR topicDetails includes Music topic
+          * optional duration bounds (if ENFORCE_DURATION)
+          * title/desc/tags contain genre synonyms; exclude negatives
+    """
+    assert video_duration in {"any", "short", "medium", "long"}
+    base_search = "https://www.googleapis.com/youtube/v3/search"
+    base_videos = "https://www.googleapis.com/youtube/v3/videos"
+    next_page_token = None
+    pages = 0
+
+    # Build per-genre syns once
+    syns = GENRE_SYNS.get(query.lower(), [query.lower(), "music"])
+
+    # Small retry for transient 5xx/429
+    def _fetch(url, params, retries=2):
+        for attempt in range(retries + 1):
+            r = requests.get(url, params=params, timeout=30)
+            if r.status_code in (500, 502, 503, 504, 429) and attempt < retries:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            return r
+        return r
+
+    while pages < MAX_PAGES_PER_GENRE:
+        # Strengthen query with "music"
+        q = f"{query} music"
+
+        search_params = {
+            "part": "snippet",
+            "q": q,
+            "type": "video",
+            "videoLicense": "creativeCommon",
+            "videoDuration": video_duration,  # any|short|medium|long
+            "maxResults": PAGE_SIZE,
+            "order": "relevance",
+            "relevanceLanguage": "en",
+            "videoEmbeddable": "true",
+            # Hint category in search stage; not authoritative, we'll verify with videos.list
+            "videoCategoryId": "10",  # Music
+            "key": api_key,
+        }
+        if next_page_token:
+            search_params["pageToken"] = next_page_token
+
+        sr = _fetch(base_search, search_params)
+        try:
+            sr.raise_for_status()
+        except Exception as e:
+            try:
+                err = sr.json()
+            except Exception:
+                err = {"error": str(e)}
+            if "quotaExceeded" in str(err):
+                logging.error(f"[search] quotaExceeded for '{query}'. Aborting genre early.")
+            else:
+                logging.error(f"[search] error for '{query}': {err}")
+            break
+
+        sdata = sr.json()
+        pages += 1
+
+        # Collect IDs from this page
+        ids = []
+        for item in sdata.get("items", []):
+            vid = item.get("id", {}).get("videoId")
+            if vid:
+                ids.append(vid)
+
+        if not ids:
+            logging.info(f"[search] '{query}' page {pages}: 0 candidates")
+            yield []
+            next_page_token = sdata.get("nextPageToken")
+            if not next_page_token:
+                break
+            continue
+
+        # videos.list to vet category/tags/duration
+        vparams = {
+            "part": "snippet,contentDetails,topicDetails",
+            "id": ",".join(ids),
+            "maxResults": len(ids),
+            "key": api_key,
+        }
+        vr = _fetch(base_videos, vparams)
+        try:
+            vr.raise_for_status()
+        except Exception as e:
+            logging.warning(f"[search] videos.list failed on page {pages} for '{query}': {e}")
+            # fallback: yield raw URLs (keep v6 behavior rather than abort)
+            urls = [f"https://www.youtube.com/watch?v={vid}" for vid in ids]
+            logging.info(f"[search] '{query}' page {pages}: {len(urls)} candidates (unvetted)")
+            yield urls
+            next_page_token = sdata.get("nextPageToken")
+            if not next_page_token:
+                break
+            continue
+
+        vdata = vr.json()
+        urls = []
+        for v in vdata.get("items", []):
+            vid = v.get("id")
+            snippet = v.get("snippet", {}) or {}
+            content = v.get("contentDetails", {}) or {}
+            topics  = v.get("topicDetails", {}) or {}
+
+            # 1) Category/topic check
+            cat_ok = (snippet.get("categoryId") == "10")
+            topic_ids = topics.get("topicIds") or topics.get("topicCategories") or []
+            # Common Music topic hints (best-effort)
+            music_topics = ["/m/04rlf", "https://en.wikipedia.org/wiki/Music"]
+            topic_ok = any(t in (topic_ids or []) for t in music_topics)
+
+            if not (cat_ok or topic_ok):
+                continue
+
+            # 2) Duration check (optional strict gate)
+            if ENFORCE_DURATION:
+                # ISO 8601 PT#M#S → seconds
+                dur = content.get("duration", "PT0S")
+                # simple parse
+                sec = 0
+                import re
+                m = re.match(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", dur)
+                if m:
+                    h = int(m.group(1) or 0); m_ = int(m.group(2) or 0); s = int(m.group(3) or 0)
+                    sec = h*3600 + m_*60 + s
+                if not (DURATION_MIN_S <= sec <= DURATION_MAX_S):
+                    continue
+
+            # 3) Title/desc/tags vet (genre synonyms + negatives)
+            # Note: tags only available from videos.list, not search results
+            snippet_with_tags = dict(snippet)
+            snippet_with_tags["tags"] = snippet.get("tags", [])
+            if not _looks_like_music(snippet_with_tags, syns, NEGATIVE_TERMS):
+                continue
+
+            urls.append(f"https://www.youtube.com/watch?v={vid}")
+
+        logging.info(f"[search] '{query}' page {pages}: {len(urls)} vetted candidates")
+        yield urls
+
+        next_page_token = sdata.get("nextPageToken")
+        if not next_page_token:
+            break
+
+def run_pipeline():
+    # Env override if present; fall back to inline for this research phase
+    api_key = os.getenv("YOUTUBE_API_KEY", API_KEY)
+    if not api_key or api_key == "YOUR_API_KEY_HERE":
+        logging.error("YOUTUBE_API_KEY is not set in env or code. Aborting.")
+        return
+
+    # Setup folders/files
+    VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
+    META_DIR.mkdir(parents=True, exist_ok=True)
+    ARCHIVE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if not ARCHIVE_FILE.exists():
+        ARCHIVE_FILE.touch()
+
+    per_genre_quota = max(1, MAX_VIDEOS // len(SEARCH_TERMS))
+    total_target = per_genre_quota * len(SEARCH_TERMS)
+
+    t0 = time.time()
+    logging.info(
+        f"Pipeline start | batch={BATCH_DIR.name} | target={total_target} | per_genre={per_genre_quota} "
+        f"| duration_gate={'ON' if ENFORCE_DURATION else 'OFF'} [{DURATION_MIN_S}-{DURATION_MAX_S}s] "
+        f"| videos_dir={VIDEOS_DIR} | meta_dir={META_DIR}"
+    )
+
+    total_downloaded = 0
+    per_genre_counts = {}
+
+    try:
+        for term in SEARCH_TERMS:
+            logging.info(f"--- Genre: {term} | Target: {per_genre_quota} ---")
+            got = fill_genre_strict(term, per_genre_quota)
+            per_genre_counts[term] = got
+            total_downloaded += got
+            logging.info(
+                f"Completed '{term}': {got}/{per_genre_quota} "
+                f"(cumulative={total_downloaded}/{total_target})"
+            )
+    except KeyboardInterrupt:
+        logging.warning("Interrupted by user. Finalizing summary…")
+
+    dt = time.time() - t0
+    logging.info(
+        f"Pipeline finished | batch={BATCH_DIR.name} | total={total_downloaded}/{total_target} "
+        f"| per-genre={per_genre_counts} | elapsed={dt:0.1f}s | videos_dir={VIDEOS_DIR} | meta_dir={META_DIR}"
+    )
+
+def backfill_info_and_desc(video_id: str, meta_dir: Path):
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    opts = {
+        "logger": YTDLPLogger(),
+        "skip_download": True,
+        "quiet": True,
+        "no_warnings": True,
+        "remote_components": ["ejs:github"],
+        "extractor_args": {"youtube": {
+            "player_client": ["web"],
+            "player_client_version": [YTDLP_PLAYER_CLIENT_VERSION],
+        }},
+    }
+    cookies_path = os.getenv("COOKIES_FILE")
+    if cookies_path and os.path.exists(cookies_path):
+        opts["cookiefile"] = cookies_path
+
+    info = None
+    try:
+        with YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as e:
+        print(f"[backfill] {video_id}: failed to extract info: {e}")
+        return False
+
+    meta_dir.mkdir(parents=True, exist_ok=True)
+    # write JSON (our name: <id>.json), always safe to create
+    try:
+        with (meta_dir / f"{video_id}.json").open("w", encoding="utf-8") as fh:
+            json.dump(info, fh, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[backfill] {video_id}: write json failed: {e}")
+
+    # write description if available
+    desc = info.get("description")
+    if desc:
+        try:
+            with (meta_dir / f"{video_id}.description").open("w", encoding="utf-8") as fh:
+                fh.write(desc)
+        except Exception as e:
+            print(f"[backfill] {video_id}: write description failed: {e}")
+
+    # OPTIONAL: thumbnail (best_thumb) via requests
+    thumb_url = None
+    thumbs = info.get("thumbnails") or []
+    if thumbs:
+        # pick the highest resolution entry
+        thumbs_sorted = sorted(thumbs, key=lambda t: (t.get("width") or 0)*(t.get("height") or 0), reverse=True)
+        thumb_url = thumbs_sorted[0].get("url")
+    if thumb_url:
+        try:
+            r = requests.get(thumb_url, timeout=15)
+            r.raise_for_status()
+            ext = ".jpg"
+            ct = r.headers.get("Content-Type","").lower()
+            if "webp" in ct: ext = ".webp"
+            (meta_dir / f"{video_id}{ext}").write_bytes(r.content)
+        except Exception as e:
+            print(f"[backfill] {video_id}: thumbnail failed: {e}")
+
+    return True
+
+# Run backfill for the current batch
+filled = 0
+for vid in missing_json:
+    ok = backfill_info_and_desc(vid, META_DIR)
+    if ok:
+        filled += 1
+    time.sleep(random.uniform(0.5, 1.2))  # be gentle
+
+print(f"Backfilled {filled} metadata entries into {META_DIR}")
+
+
+
+# Build manifest.csv for the current batch
+from pathlib import Path
+import re, json, pandas as pd
+
+BATCH = BATCH_DIR
+VID_DIR = BATCH / "videos"
+META_DIR = BATCH / "meta"
+
+media_exts = {".mp4", ".mkv", ".webm"}
+id_pat = re.compile(r"\[(?P<id>[A-Za-z0-9_-]{8,})\]\.(mp4|mkv|webm)$")
+
+rows = []
+for p in sorted(VID_DIR.glob("*")):
+    if not (p.is_file() and p.suffix.lower() in media_exts):
+        continue
+    m = id_pat.search(p.name)
+    if not m:
+        continue
+    vid = m.group("id")
+    # prefer <id>.json (our backfill) else <id>.info.json (yt-dlp default)
+    meta = META_DIR / f"{vid}.json"
+    if not meta.exists():
+        alt = META_DIR / f"{vid}.info.json"
+        meta = alt if alt.exists() else None
+
+    info = {}
+    if meta:
+        try:
+            info = json.loads(meta.read_text(encoding="utf-8"))
+        except Exception as e:
+            print(f"[warn] failed to read meta for {vid}: {e}")
+
+    # Robust extraction (keys vary slightly across versions)
+    title        = info.get("title") or info.get("fulltitle")
+    uploader     = info.get("uploader") or info.get("channel") or info.get("uploader_id")
+    channel_id   = info.get("channel_id") or info.get("uploader_id")
+    upload_date  = info.get("upload_date")  # 'YYYYMMDD' if present
+    duration_s   = info.get("duration")     # seconds
+    tags         = info.get("tags") or []
+    categories   = info.get("categories") or info.get("category") or []
+    view_count   = info.get("view_count")
+    like_count   = info.get("like_count")
+    webpage_url  = info.get("webpage_url") or f"https://www.youtube.com/watch?v={vid}"
+
+    rows.append({
+        "video_id": vid,
+        "filename": p.name,
+        "filepath": str(p.resolve()),
+        "meta_json": str((META_DIR / f"{vid}.json").resolve()) if (META_DIR / f"{vid}.json").exists() else (
+                     str((META_DIR / f"{vid}.info.json").resolve()) if (META_DIR / f"{vid}.info.json").exists() else ""),
+        "title": title,
+        "uploader": uploader,
+        "channel_id": channel_id,
+        "upload_date": upload_date,
+        "duration_s": duration_s,
+        "tags": "|".join(tags) if isinstance(tags, list) else (tags or ""),
+        "categories": "|".join(categories) if isinstance(categories, list) else (categories or ""),
+        "view_count": view_count,
+        "like_count": like_count,
+        "webpage_url": webpage_url,
+        # place-holder genre column for your downstream labeling step:
+        "genre": "",  # to be filled later by your classifier / rules
+    })
+
+df = pd.DataFrame(rows)
+out_csv = BATCH / "manifest.csv"
+df.to_csv(out_csv, index=False)
+print(f"Manifest written: {out_csv} ({len(df)} rows)")
+
+# Quick sanity summary
+print("\nSummary:")
+print(" by extension:", df["filename"].str.rsplit(".", n=1, expand=True)[1].value_counts().to_dict())
+dur = pd.to_numeric(df["duration_s"], errors="coerce")
+print(f" duration_s: count={dur.notna().sum()} | mean={dur.mean():.1f} | min={dur.min()} | max={dur.max()}")
