@@ -1,0 +1,222 @@
+# We perform a final deduplication stage here after segmentation to catch any exact duplicates
+# Setup and import
+import os
+import csv
+import math
+import hashlib
+from pathlib import Path
+import pandas as pd
+from tqdm.auto import tqdm
+import matplotlib.pyplot as plt
+
+
+# Configurations
+root = <Insert your project root>
+batch = root / "downloads" / "batch_0001"        # folder of the batch we're working on, adjust if needed
+
+MAIN_MANIFEST = batch / "s1_qc_manifest.csv"     # post-S3 manifest
+SEG_MANIFEST  = root / 'processed' / "segments" / "segments_manifest.csv"  # from S4
+
+print("Main manifest:", MAIN_MANIFEST)
+print("Segments manifest:", SEG_MANIFEST)
+
+df_main = pd.read_csv(MAIN_MANIFEST)
+df_seg  = pd.read_csv(SEG_MANIFEST)
+
+print("Main manifest rows:", len(df_main))
+print("Segments manifest rows:", len(df_seg))
+print(df_seg.columns)
+
+def sha256_file(path: Path, buf_size: int = 1 << 20) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(buf_size)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+# Work only on segments that succeeded
+seg_ok = df_seg[df_seg["seg_ok"] == True].copy()
+
+# Check existence of segment files
+seg_ok["audio_exists"] = seg_ok["path_audio_seg"].apply(lambda p: Path(p).exists())
+seg_ok["video_exists"] = seg_ok["path_video_seg"].apply(lambda p: Path(p).exists())
+
+print("Total seg_ok rows:", len(seg_ok))
+print("Audio exists counts:\n", seg_ok["audio_exists"].value_counts(dropna=False))
+print("Video exists counts:\n", seg_ok["video_exists"].value_counts(dropna=False))
+
+# Keep only those where audio (and ideally video) exist
+candidates = seg_ok[seg_ok["audio_exists"]].copy()
+print("S5 candidates (audio exists):", len(candidates))
+
+
+audio_hashes = []
+video_hashes = []
+
+for _, row in tqdm(candidates.iterrows(), total=len(candidates), desc="Hashing segments"):
+    a_path = Path(row["path_audio_seg"])
+    v_path = Path(row["path_video_seg"])
+
+    # Audio hash (required)
+    if a_path.exists():
+        ah = sha256_file(a_path)
+    else:
+        ah = ""
+
+    # Video hash (optional but useful)
+    if v_path.exists():
+        vh = sha256_file(v_path)
+    else:
+        vh = ""
+
+    audio_hashes.append(ah)
+    video_hashes.append(vh)
+
+candidates["seg_sha256_audio"] = audio_hashes
+candidates["seg_sha256_video"] = video_hashes
+
+# Quick sanity check
+print("Unique audio hashes:", candidates["seg_sha256_audio"].nunique())
+print("Unique video hashes:", candidates["seg_sha256_video"].nunique())
+
+# Initialise keep flags
+candidates["seg_keep"] = True
+candidates["seg_dup_reason"] = ""
+
+# Group by audio hash
+dup_groups = candidates.groupby("seg_sha256_audio")
+
+total_groups = len(dup_groups)
+total_dups = 0
+
+for h, grp in dup_groups:
+    if h == "" or len(grp) <= 1:
+        continue  # no hash or single item -> nothing to dedup
+
+    # Sort deterministically (e.g., by parent then seg_idx) and keep the first
+    grp_sorted = grp.sort_values(["parent_video_id", "seg_idx"])
+    keep_id = grp_sorted.iloc[0]["segment_id"]
+    dup_ids = grp_sorted.iloc[1:]["segment_id"].tolist()
+
+    total_dups += len(dup_ids)
+
+    # Mark the duplicates
+    mask = candidates["segment_id"].isin(dup_ids)
+    candidates.loc[mask, "seg_keep"] = False
+
+    # Reason: if video hash is also identical for all, call it audio+video_dup
+    same_video_hash = grp_sorted["seg_sha256_video"].nunique() == 1
+    reason = "audio+video_dup" if same_video_hash else "audio_dup"
+    candidates.loc[mask, "seg_dup_reason"] = reason
+
+print(f"Total exact-duplicate segments found: {total_dups}")
+
+# Merge dedup info back into segments manifest safely
+
+# Columns we want to bring back (if present in `candidates`)
+dedup_cols = [
+    "segment_id",
+    "seg_sha256_audio",
+    "seg_sha256_video",
+    "seg_keep",
+    "seg_dup_reason",
+]
+
+# Work out which of these actually exist in `candidates`
+available_cols = [c for c in dedup_cols if c in candidates.columns]
+
+if available_cols:
+    df_seg = df_seg.merge(
+        candidates[available_cols],
+        on="segment_id",
+        how="left",
+    )
+else:
+    # No dedup candidates (or no dedup columns yet) – leave df_seg as-is
+    print("No dedup columns found in candidates; skipping merge of dedup info.")
+
+# Ensure all expected columns exist with sensible defaults
+# seg_keep: default to seg_ok (keep all good segments) if we don't have dedup info
+if "seg_keep" not in df_seg.columns:
+    df_seg["seg_keep"] = df_seg.get("seg_ok", False).fillna(False)
+else:
+    df_seg["seg_keep"] = df_seg["seg_keep"].fillna(df_seg.get("seg_ok", False).fillna(False))
+
+# seg_dup_reason: empty string when nothing to say
+if "seg_dup_reason" not in df_seg.columns:
+    df_seg["seg_dup_reason"] = ""
+else:
+    df_seg["seg_dup_reason"] = df_seg["seg_dup_reason"].fillna("")
+
+# seg_sha256_audio / seg_sha256_video: make sure they exist (optional but tidy)
+if "seg_sha256_audio" not in df_seg.columns:
+    df_seg["seg_sha256_audio"] = ""
+if "seg_sha256_video" not in df_seg.columns:
+    df_seg["seg_sha256_video"] = ""
+
+# Save full manifest + unique subset
+SEG_FULL_DEDUP = root / "processed" / "segments" / "segments_manifest_dedup_full.csv"
+SEG_UNIQUE     = root / "processed" / "segments_manifest_dedup_unique.csv"
+
+df_seg.to_csv(SEG_FULL_DEDUP, index=False)
+df_seg[df_seg["seg_keep"]].to_csv(SEG_UNIQUE, index=False)
+
+print("Wrote full segments manifest with dedup info →", SEG_FULL_DEDUP)
+print("Wrote deduplicated segments (seg_keep==True) →", SEG_UNIQUE)
+
+print("seg_keep counts:\n", df_seg["seg_keep"].value_counts(dropna=False))
+print("dup reasons:\n", df_seg["seg_dup_reason"].value_counts(dropna=False).head(10))
+
+
+
+# Diagnostics
+# Before dedup
+counts_before = df_seg.groupby("parent_video_id")["segment_id"].count()
+
+# After dedup (keep only seg_keep)
+unique = df_seg[df_seg["seg_keep"]]
+counts_after = unique.groupby("parent_video_id")["segment_id"].count()
+
+summary = pd.DataFrame({
+    "n_segments_before": counts_before,
+    "n_segments_after": counts_after,
+}).fillna(0).astype(int)
+
+print(summary.describe())
+
+n_before = len(df_seg)
+n_after = df_seg["seg_keep"].sum()
+print(f"Segments before dedup: {n_before}")
+print(f"Segments after dedup:  {n_after}")
+print(f"Exact duplicates removed: {n_before - n_after}")
+
+
+import pandas as pd
+from pathlib import Path
+
+root = < your root> 
+seg_full = <"segments_manifest_dedup_full.csv">
+
+df = pd.read_csv(seg_full)
+
+print("Total rows:", len(df))
+print(df["seg_keep"].value_counts(dropna=False))
+print(df["seg_dup_reason"].value_counts(dropna=False))
+
+# Cross-tab: seg_ok vs seg_keep
+print("\nseg_ok vs seg_keep:")
+print(pd.crosstab(df["seg_ok"], df["seg_keep"], dropna=False))
+
+df_full["seg_dur"] = df_full["end_s"] - df_full["start_s"]
+
+plt.figure(figsize=(8,4))
+df_full["seg_dur"].hist(bins=20)
+plt.title("Distribution of Segment Durations (Should be near 10s)")
+plt.xlabel("Duration (seconds)")
+plt.ylabel("Count")
+plt.show()
+
+print(df_full["seg_dur"].describe())
