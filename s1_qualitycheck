@@ -1,0 +1,287 @@
+# --- Setup ---
+import os, sys
+from pathlib import Path
+from __future__ import annotations
+from tqdm import tqdm
+import pandas as pd
+import csv
+from datetime import datetime, timezone
+import json, subprocess, shlex, tempfile
+
+
+# Directory Check
+ROOT = Path.cwd() # Insert your desired directory 
+os.chdir(ROOT)
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+print("Using root:", ROOT)
+print("Python:", sys.executable)
+
+# Quick import check
+import video_music_ds
+from video_music_ds.utils.probe import ffprobe_info
+from video_music_ds.utils.manifests import ManifestWriter, QCRow, sha256_file
+print("video_music_ds from:", video_music_ds.__file__)
+SCHEMA_VERSION = "2025-11-10"  # bump only when you change column definitions
+print("Schema Version:", SCHEMA_VERSION) 
+
+
+def read_manifest(path):
+    import pandas as pd
+    df = pd.read_csv(path)
+    # normalize common variants
+    rename_map = {
+        "id": "video_id",
+        "videoID": "video_id",
+        "VideoId": "video_id",
+        "path": "filepath",
+        "file_path": "filepath",
+        "videoPath": "filepath",
+    }
+    df = df.rename(columns={k:v for k,v in rename_map.items() if k in df.columns})
+
+    if "video_id" not in df.columns:
+        raise ValueError(f"manifest missing 'video_id' (have columns: {list(df.columns)})")
+
+    df["video_id"] = df["video_id"].astype(str)
+    return df
+    
+def update_manifest(base_csv: Path, updates_df: pd.DataFrame, new_cols: list[str], out_csv: Path|None=None):
+    """
+    Merge `updates_df[new_cols + ['video_id']]` into base by 'video_id' only.
+    Only writes columns in `new_cols`. Leaves all other columns untouched.
+    Idempotent and safe to re-run.
+    """
+    base = read_manifest(base_csv).copy()
+    if "video_id" not in updates_df.columns:
+        raise ValueError("updates_df missing 'video_id'")
+    keep_cols = ["video_id"] + new_cols
+
+    # create columns if missing
+    for c in new_cols:
+        if c not in base.columns:
+            base[c] = pd.NA
+
+    base = base.set_index("video_id")
+    upd  = updates_df[keep_cols].set_index("video_id")
+
+    common = base.index.intersection(upd.index)
+    base.loc[common, new_cols] = upd.loc[common, new_cols]
+
+    out = out_csv or base_csv
+    base.reset_index().to_csv(out, index=False)
+    return out
+
+def rows_needing_work(df: pd.DataFrame, required_cols: list[str], ok_col: str|None=None):
+    """Return subset where any required col is NA or ok flag is False."""
+    import pandas as pd
+    mask = pd.Series(False, index=df.index)
+
+    # If a required column does not exist, treat as 'needs work' for all rows
+    for c in required_cols:
+        if c in df.columns:
+            mask = mask | df[c].isna()
+        else:
+            mask = pd.Series(True, index=df.index)
+
+    if ok_col and ok_col in df.columns:
+        mask = mask | (~df[ok_col].fillna(False).astype(bool))
+
+    return df[mask].copy()
+
+def ffprobe_json(media_path: Path, timeout_s=30):
+    """
+    Returns (ok, json_path_or_msg, error_msg_or_None).
+    Writes a compact ffprobe JSON (format+streams) next to S1 outputs.
+    """
+    out_json = None
+    try:
+        cmd = f'ffprobe -v error -print_format json -show_format -show_streams {shlex.quote(str(media_path))}'
+        res = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout_s)
+        if res.returncode != 0:
+            return False, None, res.stderr.strip()[:500]
+        data = json.loads(res.stdout)
+        # Basic sanity: at least 1 stream, at least 1 audio *or* video stream
+        streams = data.get("streams", [])
+        has_av = any(s.get("codec_type") in {"video", "audio"} for s in streams)
+        ok = bool(streams) and has_av
+        return ok, data, None
+    except subprocess.TimeoutExpired:
+        return False, None, "ffprobe_timeout"
+    except Exception as e:
+        return False, None, f"ffprobe_exception:{type(e).__name__}:{str(e)[:200]}"
+
+def write_json(obj, path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+
+MIN_SECONDS = 10.0
+
+def guess_license_from_json(sidecar: Path) -> str:
+    # Placeholder: if you have YouTube API JSON, parse it here.
+    # For now, return "unknown" if not found.
+    if sidecar.exists():
+        try:
+            import json
+            data = json.loads(sidecar.read_text(encoding="utf-8"))
+            # adjust this key based on your JSON structure
+            return data.get("license", "unknown")
+        except Exception:
+            return "unknown"
+    return "unknown"
+
+
+def run_qc(
+    raw_dir: str,
+    manifest_path: str = "manifests/dev_qc_manifest.csv",
+    overwrite: bool = False,
+    recursive: bool = False,
+    base_for_rel: str | None = None,   # NEW: base to compute filepath_rel (defaults to raw_dir)
+) -> None:
+    """
+    QC pass that records *both* legacy (id, path_raw) and canonical (video_id, filepath, filepath_rel) columns.
+    This makes later steps (that expect 'video_id'/'filepath') work without additional migration.
+
+    Requires helpers: sha256_file, ffprobe_info, guess_license_from_json
+    Uses: ManifestWriter(manifest_path, QCRow)
+    """
+    import csv
+    from datetime import datetime, timezone
+    from pathlib import Path
+    from tqdm.auto import tqdm
+
+    raw = Path(raw_dir).resolve()
+    out = Path(manifest_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    # Base for relative paths
+    base = Path(base_for_rel).resolve() if base_for_rel else raw
+
+    # 0) Overwrite handling
+    if overwrite and out.exists():
+        out.unlink()  # start fresh
+
+    # 1) Load existing hashes (to skip already-seen files)
+    existing_hashes = set()
+    existing_rows = 0
+    if out.exists() and not overwrite:
+        with open(out, newline="", encoding="utf-8") as f:
+            rdr = csv.DictReader(f)
+            for r in rdr:
+                h = r.get("sha256_raw") or r.get("sha256")  # tolerate older column name
+                if h:
+                    existing_hashes.add(h)
+                    existing_rows += 1
+
+    # Manifest writer (creates header if file doesn't exist)
+    mw = ManifestWriter(manifest_path, QCRow)
+
+    # 2) Collect candidate files
+    patterns = ["*.mp4", "*.mkv", "*.webm", "*.mov", "*.m4v"]  # a bit broader
+    vids = []
+    if recursive:
+        for pat in patterns: vids.extend(raw.rglob(pat))
+    else:
+        for pat in patterns: vids.extend(raw.glob(pat))
+    vids = sorted({p.resolve() for p in vids})
+
+    # 3) Process, skipping duplicates by sha256_raw
+    added = 0
+    skipped = 0
+    for p in tqdm(vids, desc="QC"):
+        try:
+            h = sha256_file(p)  # precompute once
+            if h in existing_hashes:
+                skipped += 1
+                continue
+
+            info = ffprobe_info(str(p))
+            lic  = guess_license_from_json(p.with_suffix(".json"))
+
+            # Basic QC rule of thumb; adapt as needed
+            dur = float(info.get("duration", 0.0) or 0.0)
+            w   = int(info.get("width", 0) or 0)
+            hpx = int(info.get("height", 0) or 0)
+            fps = float(info.get("fps", 0.0) or 0.0)
+            vco = info.get("vcodec", "unknown") or "unknown"
+            aco = info.get("acodec", "unknown") or "unknown"
+
+            ok = (dur >= MIN_SECONDS and w > 0 and hpx > 0)
+
+            # Canonical columns (in addition to legacy)
+            abs_path = str(p)
+            rel_path = str(p.relative_to(base)) if (str(p).startswith(str(base))) else ""
+
+            row = {
+                # Legacy schema (kept for compatibility)
+                "id": p.stem,
+                "path_raw": abs_path,
+
+                # Canonical schema (NEW)
+                "video_id": p.stem,
+                "filepath": abs_path,
+                "filepath_rel": rel_path,
+
+                # QC fields
+                "duration": dur,
+                "width": w,
+                "height": hpx,
+                "fps": fps,
+                "vcodec": vco,
+                "acodec": aco,
+                "license": lic or "unknown",
+                "sha256_raw": h,
+                "qc_pass": bool(ok),
+                "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            }
+
+            mw.append(row)
+            existing_hashes.add(row["sha256_raw"])
+            added += 1
+
+        except Exception as e:
+            # Attempt to record a minimal failure row if hash is obtainable and new
+            try:
+                h  # exists?
+            except NameError:
+                try:
+                    h = sha256_file(p)
+                except Exception:
+                    h = None
+
+            abs_path = str(p)
+            rel_path = str(p.relative_to(base)) if (str(p).startswith(str(base))) else ""
+
+            if h is not None and h not in existing_hashes:
+                mw.append({
+                    "id": p.stem,
+                    "path_raw": abs_path,
+                    "video_id": p.stem,       # canonical
+                    "filepath": abs_path,     # canonical
+                    "filepath_rel": rel_path, # canonical
+                    "duration": 0.0,
+                    "width": 0,
+                    "height": 0,
+                    "fps": 0.0,
+                    "vcodec": "unknown",
+                    "acodec": "unknown",
+                    "license": "unknown",
+                    "sha256_raw": h,
+                    "qc_pass": False,
+                    "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                })
+                existing_hashes.add(h)
+                added += 1
+            else:
+                skipped += 1
+            print(f"[QC] Error on {p.name}: {e}")
+
+    # 4) Tiny summary
+    total_after = existing_rows + added
+    print(f"[QC] existing_rows={existing_rows}  added={added}  skipped={skipped}  total_now={total_after}")
+
+# Call function
+if __name__ == "__main__":
+    run_qc(<Video Folder> , <manifest_out_path>)
+
+
