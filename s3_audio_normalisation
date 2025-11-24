@@ -1,0 +1,409 @@
+import os
+import math
+import json
+import shlex
+import subprocess
+from pathlib import Path
+import pandas as pd
+from tqdm.auto import tqdm
+import librosa
+
+# CONFIG (adjust as needed)
+ROOT   = Path.cwd().parent                                      # project root
+BATCH  = ROOT/"downloads/batch_0001"   
+MANIFEST = BATCH/"2_s1_qc_manifest.csv" 
+
+# Where to save normalised WAVs
+AUDIO_DIR = Path(ROOT/'processed/downloads/batch_0001/audio_norm')  # ← change batch path if needed
+AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+
+# Overwrite behaviour for audio files
+OVERWRITE_AUDIO = False
+
+# GTZAN-like genre labels for title heuristics
+SEARCH_TERMS = [
+    "blues", "classical", "country", "disco",
+    "hiphop", "jazz", "metal", "pop", "reggae", "rock"
+]
+
+def run_cmd(cmd: str, timeout_s: int = 600):
+    """Run shell command; return (returncode, stdout, stderr) as text."""
+    proc = subprocess.run(
+        cmd,
+        shell=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=timeout_s,
+    )
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def read_manifest(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    if "video_id" not in df.columns:
+        raise ValueError("manifest missing 'video_id'")
+    return df
+
+
+def update_manifest(manifest_path: Path, updates_df: pd.DataFrame, cols):
+    """
+    Left-merge updates_df into manifest on `video_id`, updating only `cols`.
+    Safe if some cols don't exist yet; they will be created.
+    """
+    base = read_manifest(manifest_path)
+
+    if updates_df.empty:
+        print("update_manifest: no updates to apply.")
+        return str(manifest_path)
+
+    if "video_id" not in updates_df.columns:
+        raise ValueError("updates_df missing 'video_id'")
+
+    # Ensure all update columns exist on the updates side
+    for c in cols:
+        if c not in updates_df.columns:
+            updates_df[c] = pd.NA
+
+    merged = base.merge(
+        updates_df[["video_id"] + list(cols)],
+        on="video_id",
+        how="left",
+        suffixes=("", "_new"),
+    )
+
+    # For each column we care about: if *_new exists, use it when non-null
+    for c in cols:
+        new_col = f"{c}_new"
+        if new_col in merged.columns:
+            merged[c] = merged[new_col].combine_first(merged.get(c))
+            merged.drop(columns=[new_col], inplace=True)
+
+    merged.to_csv(manifest_path, index=False)
+    return str(manifest_path)
+
+def extract_bpm_and_key(wav_path: Path):
+  """
+  Rough BPM + key estimation via librosa.
+  Returns (bpm, key_str). On failure, (NaN, "").
+  """
+  try:
+      y, sr = librosa.load(str(wav_path), sr=None, mono=True)
+      if y.size == 0:
+          return math.nan, ""
+  
+      # BPM
+      tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+      bpm = float(tempo) if tempo is not None else math.nan
+  
+      # Very rough key guess using chroma
+      chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
+      chroma_mean = chroma.mean(axis=1)
+      pitch_class = chroma_mean.argmax()
+      key_map = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+      key = key_map[int(pitch_class)] if not math.isnan(pitch_class) else ""
+  
+      return bpm, key
+  except Exception:
+      return math.nan, ""
+
+
+def guess_genre_from_title(title: str, terms=SEARCH_TERMS):
+    """
+    Very simple heuristic: look for genre words in the title (case-insensitive).
+    Returns (genre_guess, needs_review).
+    """
+    t = str(title).lower()
+    for g in terms:
+        if g in t:
+            return g, False
+    return "", True
+
+
+def extract_and_normalise_audio(src: Path, out_wav: Path):
+    """
+    Extract audio from a standardised video and apply EBU R128 loudnorm.
+    We don't parse loudnorm's JSON; we just apply the filter so that
+    all outputs are at a consistent listening level.
+    """
+    out_wav.parent.mkdir(parents=True, exist_ok=True)
+
+    cmd = (
+        "ffmpeg -y -loglevel error -hide_banner "
+        f"-i {shlex.quote(str(src))} "
+        "-vn -sn -dn "
+        "-af loudnorm=I=-16:LRA=11:TP=-1.5 "
+        "-ar 48000 -ac 2 -sample_fmt s16 "
+        f"{shlex.quote(str(out_wav))}"
+    )
+    rc, out, err = run_cmd(cmd, timeout_s=600)
+    if rc != 0:
+        raise RuntimeError(f"norm_fail: rc={rc}; {(err or '')[:200]}")
+
+        df = read_manifest(MANIFEST)
+print("Loaded manifest rows:", len(df))
+
+# Ensure aud_ok exists and treat missing as False
+if "aud_ok" not in df.columns:
+    df["aud_ok"] = False
+
+# Candidates:
+#  - have a standardised video
+#  - not yet processed for audio or previously failed (aud_ok is False/NaN)
+candidates = df[
+    (df.get("vid_std_ok", False) == True) &
+    (df.get("vid_std_path").notna()) &
+    (~df["aud_ok"].fillna(False))
+].copy()
+
+print(f"S3 candidates: {len(candidates)}")
+
+updates = []
+
+for _, row in tqdm(candidates.iterrows(), total=len(candidates)):
+    vid   = row["video_id"]
+    title = row["video_id"]  # you can swap this for a 'title' column if you add one
+    src   = Path(row["vid_std_path"])
+
+    if not src.exists():
+        updates.append({
+            "video_id": vid,
+            "aud_path": "",
+            "aud_lufs_i": pd.NA,
+            "aud_true_peak": pd.NA,
+            "aud_lra": pd.NA,
+            "aud_bpm": pd.NA,
+            "aud_key": "",
+            "genre_guess": "",
+            "genre_needs_review": True,
+            "aud_ok": False,
+            "aud_error": "src_missing",
+        })
+        continue
+
+    out_wav = AUDIO_DIR / f"{vid}.norm.wav"
+
+    try:
+        # If we already have a normalised WAV and OVERWRITE_AUDIO is False,
+        # skip extraction and just analyse features (idempotent behaviour).
+        if not out_wav.exists() or OVERWRITE_AUDIO:
+            extract_and_normalise_audio(src, out_wav)
+
+        # At this point out_wav should exist
+        if not out_wav.exists():
+            raise RuntimeError("norm_output_missing")
+
+        # (Optional) approximate loudness metrics via librosa RMS
+        try:
+            y, sr = librosa.load(str(out_wav), sr=None, mono=True)
+            if y.size:
+                rms = float(librosa.feature.rms(y=y).mean())
+                # Convert to dBFS as a rough loudness proxy
+                aud_lufs_i = 20 * math.log10(rms + 1e-9)
+            else:
+                aud_lufs_i = math.nan
+            aud_true_peak = math.nan
+            aud_lra       = math.nan
+        except Exception:
+            aud_lufs_i   = math.nan
+            aud_true_peak = math.nan
+            aud_lra       = math.nan
+
+        # BPM + key
+        bpm, key = extract_bpm_and_key(out_wav)
+
+        # Genre guess from title
+        g, needs_review = guess_genre_from_title(title, SEARCH_TERMS)
+
+        updates.append({
+            "video_id": vid,
+            "aud_path": str(out_wav.resolve()),
+            "aud_lufs_i": aud_lufs_i,
+            "aud_true_peak": aud_true_peak,
+            "aud_lra": aud_lra,
+            "aud_bpm": bpm,
+            "aud_key": key,
+            "genre_guess": g,
+            "genre_needs_review": needs_review,
+            "aud_ok": True,
+            "aud_error": "",
+        })
+
+    except Exception as e:
+        updates.append({
+            "video_id": vid,
+            "aud_path": "",
+            "aud_lufs_i": pd.NA,
+            "aud_true_peak": pd.NA,
+            "aud_lra": pd.NA,
+            "aud_bpm": pd.NA,
+            "aud_key": "",
+            "genre_guess": "",
+            "genre_needs_review": True,
+            "aud_ok": False,
+            "aud_error": f"{type(e).__name__}:{str(e)[:200]}",
+        })
+
+# Merge back into manifest 
+upd_df = pd.DataFrame(updates)
+
+S3_COLS = [
+    "aud_path",
+    "aud_lufs_i",
+    "aud_true_peak",
+    "aud_lra",
+    "aud_bpm",
+    "aud_key",
+    "genre_guess",
+    "genre_needs_review",
+    "aud_ok",
+    "aud_error",
+]
+
+if upd_df.empty:
+    print("S3: no updates; manifest unchanged.")
+else:
+    out_csv = update_manifest(MANIFEST, upd_df, S3_COLS)
+    print("Manifest updated →", out_csv)
+
+import matplotlib.pyplot as plt
+
+df2 = read_manifest(MANIFEST)
+
+print("S3 summary:", df2["aud_ok"].value_counts(dropna=False).to_dict())
+
+print("\nGenre counts (top 15):")
+print(df2["genre_guess"].value_counts(dropna=False).head(15))
+
+print("\nBPM summary:")
+print(df2["aud_bpm"].describe())
+
+# BPM histogram
+plt.figure(figsize=(6,4))
+df2["aud_bpm"].dropna().astype(float).plot(kind="hist", bins=30)
+plt.xlabel("Estimated BPM")
+plt.ylabel("Count")
+plt.title("BPM distribution after S3")
+plt.grid(True, linestyle="--", alpha=0.4)
+plt.tight_layout()
+plt.show()
+
+import re
+
+def loudnorm_analyse_lufs(src: Path):
+    """
+    Run loudnorm in analysis mode on a WAV and return input_i (LUFS).
+    This does NOT change the file; it just measures.
+    """
+    cmd = (
+        "ffmpeg -y -loglevel info -hide_banner "
+        f"-i {shlex.quote(str(src))} "
+        "-af loudnorm=I=-16:LRA=11:TP=-1.5:print_format=json "
+        "-f null -"
+    )
+    rc, out, err = run_cmd(cmd, timeout_s=600)
+    if rc != 0:
+        raise RuntimeError(f"loudnorm_analyse_fail: rc={rc}; {(err or '')[:200]}")
+
+    # loudnorm prints JSON to stderr; extract the first {...} block
+    m = re.search(r'\{.*\}', err, re.S)
+    if not m:
+        raise RuntimeError("loudnorm_json_parse_fail:no_braces")
+
+    try:
+        data = json.loads(m.group(0))
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"loudnorm_json_parse_fail: {e}")
+
+    # When auditing the *already-normalised* WAV,
+    # this "input_i" should be around -16.
+    val = data.get("input_i", None)
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return math.nan
+
+
+# --------- Run audit and update manifest ---------
+df = read_manifest(MANIFEST)
+
+ok_rows = df[(df.get("aud_ok", False) == True) & df["aud_path"].notna()].copy()
+print("LUFS audit candidates:", len(ok_rows))
+
+audits = []
+for _, row in tqdm(ok_rows.iterrows(), total=len(ok_rows)):
+    vid = row["video_id"]
+    wav = Path(row["aud_path"])
+    if not wav.exists():
+        audits.append({"video_id": vid, "aud_lufs_out": math.nan})
+        continue
+    try:
+        lufs = loudnorm_analyse_lufs(wav)
+    except Exception as e:
+        print(f"[audit] error on {vid}: {e}")
+        lufs = math.nan
+    audits.append({"video_id": vid, "aud_lufs_out": lufs})
+
+audit_df = pd.DataFrame(audits)
+out_csv = update_manifest(MANIFEST, audit_df, ["aud_lufs_out"])
+print("Manifest updated with aud_lufs_out →", out_csv)
+
+df = read_manifest(MANIFEST)
+vals = df["aud_lufs_i"].dropna().astype(float)
+
+print("Input LUFS summary (aud_lufs_i):")
+print(vals.describe())
+
+df = read_manifest(MANIFEST)
+vals = df["aud_lufs_out"].dropna().astype(float)
+
+print("Output LUFS summary (aud_lufs_out):")
+print(vals.describe())
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+fig, ax = plt.subplots(figsize=(10, 6))
+
+sns.kdeplot(df["aud_lufs_i"], label="Before (aud_lufs_i)", linewidth=2)
+sns.kdeplot(df["aud_lufs_out"], label="After (aud_lufs_out)", linewidth=2)
+
+ax.axvline(-16, color="red", linestyle="--", linewidth=1.5, label="Target −16 LUFS")
+
+ax.set_title("Before vs After Loudness Normalisation (EBU R128)", fontsize=14)
+ax.set_xlabel("Integrated Loudness (LUFS)")
+ax.set_ylabel("Density")
+ax.legend()
+
+plt.show()
+
+fig, ax = plt.subplots(1, 2, figsize=(12,4))
+
+ax[0].hist(df["aud_lufs_i"].dropna(), bins=30, alpha=0.8)
+ax[0].set_title("Input Loudness (LUFS)")
+ax[0].set_xlabel("LUFS")
+ax[0].set_ylabel("Count")
+
+ax[1].hist(df["aud_lufs_out"].dropna(), bins=30, alpha=0.8, color="orange")
+ax[1].set_title("Output Loudness (LUFS)")
+ax[1].set_xlabel("LUFS")
+ax[1].set_ylabel("Count")
+
+plt.tight_layout()
+plt.show()
+
+plt.figure(figsize=(6,4))
+plt.hist(df["aud_bpm"].dropna(), bins=30, alpha=0.8)
+plt.xlabel("Tempo (BPM)")
+plt.ylabel("Count")
+plt.title("Distribution of Estimated Tempo")
+plt.grid(True, linestyle="--", alpha=0.5)
+plt.show()
+
+plt.figure(figsize=(6,4))
+df["aud_key"].dropna().value_counts().sort_index().plot(kind="bar")
+plt.xlabel("Pitch Class (0–11)")
+plt.ylabel("Count")
+plt.title("Distribution of Estimated Musical Key")
+plt.xticks(rotation=0)
+plt.show()
