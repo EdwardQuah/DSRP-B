@@ -1,0 +1,463 @@
+from pathlib import Path
+import json, subprocess, shlex, tempfile, os, math
+import pandas as pd
+from tqdm.auto import tqdm
+from typing import Optional, Tuple
+
+# Configs and paths (edit as needed) 
+root = Path.cwd().parent
+batch = root/"downloads/batch_0001" #batch number
+manifest = root/"manifests" 
+BATCH = batch/'videos'               
+MANIFEST = batch/'2_s1_qc_manifest.csv'  
+S2_OUT_DIR     = root/'processed/vid_std' # output directory
+TARGET_RES     = (1280, 720)    # (W, H)
+TARGET_FPS     = 30.0
+V_BITRATE      = "2500k"        # target video bitrate
+A_BITRATE      = "160k"         # target audio bitrate
+OVERWRITE      = False          # keep idempotent; no clobber
+TIMEOUT_S      = 1800           # 30 min safety for long files
+S2_OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+def read_manifest(path):
+    import pandas as pd
+    df = pd.read_csv(path)
+    # normalize common variants
+    rename_map = {
+        "id": "video_id",
+        "videoID": "video_id",
+        "VideoId": "video_id",
+        "path": "path_raw",
+        "file_path": "filepath",
+        "videoPath": "filepath",
+    }
+    df = df.rename(columns={k:v for k,v in rename_map.items() if k in df.columns})
+
+    if "video_id" not in df.columns:
+        raise ValueError(f"manifest missing 'video_id' (have columns: {list(df.columns)})")
+
+    df["video_id"] = df["video_id"].astype(str)
+    return df
+
+def update_manifest(base_csv: Path, updates_df: pd.DataFrame, new_cols: list[str], out_csv: Path|None=None):
+    base = read_manifest(base_csv).copy()
+    if "video_id" not in updates_df.columns:
+        raise ValueError("updates_df missing 'video_id'")
+    # Create S2 columns if absent
+    for c in new_cols:
+        if c not in base.columns:
+            base[c] = pd.NA
+    base = base.set_index("video_id")
+    upd  = updates_df[["video_id"] + new_cols].set_index("video_id")
+    common = base.index.intersection(upd.index)
+    base.loc[common, new_cols] = upd.loc[common, new_cols]
+    out = out_csv or base_csv
+    base.reset_index().to_csv(out, index=False)
+    return out
+
+def rows_needing_work(df: pd.DataFrame, cols: list[str], ok_col: str|None=None):
+    mask = pd.Series(False, index=df.index)
+    for c in cols:
+        if c in df.columns:
+            mask = mask | df[c].isna()
+        else:
+            mask = pd.Series(True, index=df.index)
+    if ok_col and ok_col in df.columns:
+        mask = mask | (~df[ok_col].fillna(False).astype(bool))
+    return df[mask].copy()
+    
+def load_ffprobe_json(path: str|Path) -> dict|None:
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+def current_props_from_probe(probe: dict):
+    """Return (w,h,fps, vcodec, acodec) or (None,... ) if missing."""
+    if not probe:
+        return None, None, None, None, None
+    v_streams = [s for s in probe.get("streams", []) if s.get("codec_type")=="video"]
+    a_streams = [s for s in probe.get("streams", []) if s.get("codec_type")=="audio"]
+    vw = vh = vfps = None
+    vcodec = acodec = None
+
+    if v_streams:
+        v = v_streams[0]
+        vw, vh = v.get("width"), v.get("height")
+        # fps: r_frame_rate like "30000/1001"
+        r = v.get("r_frame_rate") or v.get("avg_frame_rate") or "0/1"
+        try:
+            num, den = r.split("/")
+            vfps = float(num) / float(den) if float(den) else None
+        except Exception:
+            vfps = None
+        vcodec = v.get("codec_name")
+    if a_streams:
+        acodec = a_streams[0].get("codec_name")
+    return vw, vh, vfps, vcodec, acodec
+
+def needs_transcode(probe: dict) -> bool:
+    """Decide if we must standardise. Skip if already H.264+AAC, <=720p, ~30fps (+/-1)."""
+    vw, vh, fps, vcodec, acodec = current_props_from_probe(probe)
+    if any(x is None for x in [vw, vh, fps, vcodec]):
+        return True
+    # codecs
+    if vcodec != "h264": 
+        return True
+    if acodec not in (None, "aac"):  # allow silent/no audio (None) to pass; S3 will handle audio later
+        return True
+    # resolution
+    if vw > TARGET_RES[0] or vh > TARGET_RES[1]:
+        return True
+    # fps tolerance: if wildly off 30, re-encode
+    if fps and abs(fps - TARGET_FPS) > 1.0:
+        return True
+    return False
+
+def mk_std_path(video_id: str) -> Path:
+    return S2_OUT_DIR / f"{video_id}.std.mp4"
+
+def run_cmd(cmd: str, timeout_s: int = TIMEOUT_S):
+    res = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout_s)
+    return res.returncode, res.stdout, res.stderr
+
+def _even_scale_expr(max_w, max_h):
+    return (
+        f"scale='trunc(min({max_w},iw)/2)*2':'trunc(min({max_h},ih)/2)*2':"
+        f"force_original_aspect_ratio=decrease,setsar=1,"
+        f"fps={TARGET_FPS},format=yuv420p"
+    )
+def _probe_has_audio(probe: dict) -> bool:
+    return any(s.get("codec_type") == "audio" for s in (probe or {}).get("streams", []))
+
+def transcode_to_standard(src: Path, dst: Path, probe: Optional[dict] = None) -> Tuple[bool, str]:
+    """
+    Transcode input video to a standardised MP4 **with audio preserved**.
+
+    - H.264, yuv420p
+    - target fps ~30
+    - audio: AAC stereo, 48kHz
+    Returns (ok: bool, message: str).
+    """
+    dst.parent.mkdir(parents=True, exist_ok=True)
+
+    # Use probe if available (but it's optional)
+    width = height = None
+    if probe is not None:
+        vstreams = [s for s in probe.get("streams", []) if s.get("codec_type") == "video"]
+        if vstreams:
+            vs = vstreams[0]
+            width  = vs.get("width")
+            height = vs.get("height")
+
+    # Build a scale+fps filter
+    vf_parts = []
+    if width and height:
+        # Cap at 1280x720, keep AR, ensure even dims
+        vf_parts.append(
+            "scale='if(gt(iw,ih),min(iw,1280),-2)':'if(gt(ih,iw),min(ih,720),-2)':flags=lanczos"
+        )
+    else:
+        vf_parts.append("scale=1280:-2:flags=lanczos")
+
+    vf_parts.append("fps=30")
+    vf = ",".join(vf_parts)
+
+    cmd = (
+        "ffmpeg -y -loglevel error -hide_banner "
+        f"-i {shlex.quote(str(src))} "
+        # *** THIS IS THE KEY LINE: keep video + audio ***
+        "-map 0:v:0 -map 0:a:0? "
+        # video
+        f"-vf {shlex.quote(vf)} "
+        "-c:v libx264 -preset medium -crf 18 "
+        "-pix_fmt yuv420p "
+        # audio
+        "-c:a aac -b:a 160k -ac 2 -ar 48000 "
+        "-movflags +faststart "
+        f"{shlex.quote(str(dst))}"
+    )
+
+    rc, so, se = run_cmd(cmd, timeout_s=1800)
+    if rc != 0:
+        return False, f"ffmpeg_rc={rc} | {se[:400]}"
+    return True, "ok"
+
+# Diagnosis
+from collections import Counter
+df = pd.read_csv(MANIFEST)
+
+print("S2 summary:", df.get("vid_std_ok", pd.Series(dtype=bool)).value_counts(dropna=False).to_dict())
+
+# Show top error fingerprints (if any)
+errs = df.get("vid_std_error")
+if errs is not None:
+    top = Counter(errs.fillna("").str.replace(r"\s+", " ", regex=True).str[:120])
+    top = {k:v for k,v in top.items() if k}
+    top_sorted = dict(sorted(top.items(), key=lambda kv: kv[1], reverse=True))
+    print("\nTop error types (trimmed):")
+    for k, v in list(top_sorted.items())[:12]:
+        print(f"{v:>4}  {k}")
+
+# Re-run only failures helper (toggle RUN_RETRY=True to execute)
+RUN_RETRY = False
+if RUN_RETRY:
+    retry = df[(df.get("qc_ok")==True) & (df.get("vid_std_ok")==False)].copy()
+    print("Retrying:", len(retry))
+    # call your existing retry block or function here
+
+TARGET_W, TARGET_H = 1280, 720
+TARGET_FPS = 30.0
+FPS_TOL    = 0.3  # allow tiny float differences
+VIDEO_CODEC = "h264"
+AUDIO_CODEC = "aac"  # audio optional; ok if no audio stream
+PIX_FMT     = "yuv420p"
+
+def run_cmd(cmd, timeout_s=300):
+    import subprocess, textwrap
+    p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        out, err = p.communicate(timeout=timeout_s)
+        return p.returncode, out, err
+    except subprocess.TimeoutExpired:
+        p.kill()
+        return 124, "", "timeout"
+
+def probe_json(path: Path):
+    rc, so, se = run_cmd(
+        f'ffprobe -v error -print_format json -show_format -show_streams {shlex.quote(str(path))}', timeout_s=120
+    )
+    if rc != 0:
+        return False, None, se
+    try:
+        return True, json.loads(so), ""
+    except Exception as e:
+        return False, None, f"json_err:{e}"
+
+def streams_of_type(probe, stype):
+    return [s for s in (probe or {}).get("streams", []) if s.get("codec_type")==stype]
+
+def float_fps(stream):
+    # handles "num/den" and float strings
+    r = stream.get("avg_frame_rate") or stream.get("r_frame_rate")
+    if not r: return None
+    if "/" in r:
+        n, d = r.split("/")
+        try:
+            n, d = float(n), float(d)
+            return n/d if d else None
+        except: return None
+    try:
+        return float(r)
+    except:
+        return None
+
+df = read_manifest(MANIFEST)
+
+# Only rows that passed QC
+candidates = df.query("qc_pass == True").copy()
+
+# If vid_std_ok exists, only process ones that aren't done yet
+if "vid_std_ok" in candidates.columns:
+    candidates = candidates[~candidates["vid_std_ok"].fillna(False)]
+
+print(f"S2: candidates needing standardisation: {len(candidates)}")
+
+updates = []
+
+for _, row in tqdm(candidates.iterrows(), total=len(candidates)):
+    vid = row["video_id"]
+
+    src = Path(row["path_raw"])
+    if not src.exists():
+        updates.append({
+            "video_id": vid,
+            "vid_std_path": "",
+            "vid_std_res": "",
+            "vid_std_fps": pd.NA,
+            "vid_std_codec": "",
+            "vid_std_ok": False,
+            "vid_std_error": "file_missing",
+        })
+        continue
+
+    probe = {
+        "streams": [
+            {
+                "width":  row.get("width", 0),
+                "height": row.get("height", 0),
+                "r_frame_rate": f"{row.get('fps', 0)}/1" if pd.notna(row.get("fps")) else "0/1",
+                "codec_type": "video",
+                "codec_name": row.get("vcodec", ""),
+            }
+        ]
+    }
+
+    out_path = mk_std_path(vid)         # e.g. root/processed/vid_std/<id>.std.mp4
+    out_mkv  = out_path.with_suffix(".mkv")
+
+    # If already exists and we’re not overwriting, just probe & record
+    existing = out_path if out_path.exists() else (out_mkv if out_mkv.exists() else None)
+    if existing is not None and not OVERWRITE:
+        rc, so, se = run_cmd(
+            f'ffprobe -v error -print_format json -show_format -show_streams {shlex.quote(str(existing))}',
+            timeout_s=120,
+        )
+        if rc == 0:
+            dst = json.loads(so)
+            vw, vh, fps, vcodec, acodec = current_props_from_probe(dst)
+            updates.append({
+                "video_id": vid,
+                "vid_std_path": str(existing.resolve()),
+                "vid_std_res": f"{vw}x{vh}" if vw and vh else "",
+                "vid_std_fps": round(fps, 3) if fps else pd.NA,
+                "vid_std_codec": f"{(vcodec or '')}_{(acodec or '')}",
+                "vid_std_ok": True,
+                "vid_std_error": "",
+            })
+            continue
+        # if ffprobe fails, we will fall through and try to re-standardise
+
+    try:
+        # Decide whether we need to transcode or just copy
+        if not needs_transcode(probe):
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            rc, _, err = run_cmd(
+                f'ffmpeg -y -loglevel error -hide_banner '
+                f'-i {shlex.quote(str(src))} '
+                f'-c:v libx264 -pix_fmt yuv420p -r 30 -vf "scale=trunc(iw/2)*2:trunc(ih/2)*2" '
+                f'-c:a aac -b:a 160k '
+                f'{shlex.quote(str(out_path))}',
+                timeout_s=600,
+            )
+            if rc != 0:
+                raise RuntimeError(f"stream_copy_or_encode_fail:{(err or '')[:200]}")
+            produced = out_path
+        else:
+            ok, msg = transcode_to_standard(src, out_path, probe)
+            if not ok:
+                raise RuntimeError(msg)
+            produced = out_path if out_path.exists() else out_mkv
+
+        rc, so, se = run_cmd(
+            f'ffprobe -v error -print_format json -show_format -show_streams {shlex.quote(str(produced))}',
+            timeout_s=120,
+        )
+        dst = json.loads(so) if rc == 0 else None
+        vw, vh, fps, vcodec, acodec = current_props_from_probe(dst)
+        updates.append({
+            "video_id": vid,
+            "vid_std_path": str(produced.resolve()),
+            "vid_std_res": f"{vw}x{vh}" if vw and vh else "",
+            "vid_std_fps": round(fps, 3) if fps else pd.NA,
+            "vid_std_codec": f"{(vcodec or '')}_{(acodec or '')}",
+            "vid_std_ok": True,
+            "vid_std_error": "",
+        })
+
+    except Exception as e:
+        updates.append({
+            "video_id": vid,
+            "vid_std_path": "",
+            "vid_std_res": "",
+            "vid_std_fps": pd.NA,
+            "vid_std_codec": "",
+            "vid_std_ok": False,
+            "vid_std_error": f"{type(e).__name__}:{str(e)[:300]}",
+        })
+
+#  merge into manifest safely 
+upd_df = pd.DataFrame(updates)
+print("len(updates):", len(updates))
+print("upd_df.columns:", list(upd_df.columns))
+
+S2_COLS = [
+    "vid_std_path",
+    "vid_std_res",
+    "vid_std_fps",
+    "vid_std_codec",
+    "vid_std_ok",
+    "vid_std_error",
+]
+
+if upd_df.empty:
+    print("S2: no updates to write; manifest left unchanged.")
+else:
+    out_csv = update_manifest(
+        MANIFEST,
+        upd_df,
+        ["vid_std_path","vid_std_res","vid_std_fps","vid_std_codec","vid_std_ok","vid_std_error"]
+    )
+    print(f"S2: manifest updated → {out_csv}")
+final = read_manifest(MANIFEST)
+print("S2 summary:",
+      final.get("vid_std_ok", pd.Series(dtype=bool)).value_counts(dropna=False).to_dict())
+
+      df = pd.read_csv(MANIFEST)
+
+print("Total rows:", len(df))
+print("vid_std_ok value counts:", df["vid_std_ok"].value_counts(dropna=False))
+print("Any missing vid_std_path?", df["vid_std_path"].isna().any())
+
+print("\nSample of standardised paths:")
+print(df[["video_id", "path_raw", "vid_std_path"]].head())
+
+print("\nCodec distribution:")
+print(df["vid_std_codec"].value_counts().head())
+
+print("\nvid_std_fps describe:")
+print(df["vid_std_fps"].describe())
+
+print("\nTop vid_std_codec values:")
+print(df["vid_std_codec"].value_counts().head(10))
+
+# Parse resolution into width and height
+res = df["vid_std_res"].str.extract(r"(?P<std_w>\d+)x(?P<std_h>\d+)")
+df["std_w"] = pd.to_numeric(res["std_w"], errors="coerce")
+df["std_h"] = pd.to_numeric(res["std_h"], errors="coerce")
+
+print("\nstd_w describe:")
+print(df["std_w"].describe())
+print("\nstd_h describe:")
+print(df["std_h"].describe())
+
+import matplotlib.pyplot as plt
+
+df_s2 = df
+
+fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+
+#  Top-left: FPS histogram 
+axes[0, 0].hist(df_s2["vid_std_fps"].dropna(), bins=10)
+axes[0, 0].set_xlabel("Standardised FPS")
+axes[0, 0].set_ylabel("Count")
+axes[0, 0].set_title("Distribution of FPS After S2")
+axes[0, 0].grid(True, linestyle="--", alpha=0.4)
+
+#  Top-right: codec combos bar chart 
+df_s2["vid_std_codec"].value_counts().head(10).plot(
+    kind="bar",
+    ax=axes[0, 1]
+)
+axes[0, 1].set_ylabel("Count")
+axes[0, 1].set_title("Top Video/Audio Codec Combos After S2")
+axes[0, 1].tick_params(axis="x", rotation=45)
+axes[0, 1].grid(axis="y", linestyle="--", alpha=0.4)
+
+#  Bottom-left: width histogram 
+axes[1, 0].hist(df_s2["std_w"].dropna(), bins=20, color="cornflowerblue")
+axes[1, 0].set_title("Width Distribution After S2")
+axes[1, 0].set_xlabel("Width (px)")
+axes[1, 0].set_ylabel("Count")
+axes[1, 0].grid(True, linestyle="--", alpha=0.4)
+
+# Bottom-right: height histogram 
+axes[1, 1].hist(df_s2["std_h"].dropna(), bins=20,color="lightseagreen")
+axes[1, 1].set_title("Height Distribution After S2")
+axes[1, 1].set_xlabel("Height (px)")
+axes[1, 1].set_ylabel("Count")
+axes[1, 1].grid(True, linestyle="--", alpha=0.4)
+
+plt.tight_layout()
+
+plt.show()
